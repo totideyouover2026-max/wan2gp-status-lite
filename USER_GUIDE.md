@@ -33,6 +33,6 @@ After a task completes, its temporary settings and performance samples are disca
 ## Troubleshooting
 
 - If the panel does not appear, confirm Status Lite is enabled and restart Wan2GP.
-- Do not enable Status Lite and Status Pro together.
+- If Status Lite and Status Pro are both enabled, Status Pro takes precedence and Lite intentionally does not display or install its observers. Disable Pro and restart Wan2GP to use Lite instead.
 - If download detail is unavailable after an upstream Wan2GP change, generation-stage tracking should still operate.
 - If a stage says Wan2GP did not report intermediate progress, the underlying model or workflow did not expose a finer-grained callback for that stage.

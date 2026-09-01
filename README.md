@@ -28,7 +28,7 @@ The only browser preference Status Lite stores is whether its panel is collapsed
 
 Copy this folder into Wan2GP's `plugins` directory, then restart Wan2GP and enable **Status Lite** in the plugin manager.
 
-Status Lite and Status Pro are alternatives. Install or enable one of them, not both, because both observe the same Wan2GP generation callbacks.
+Status Lite and Status Pro are alternative presentations. You normally only need one, but installing or enabling both is safe: Status Pro takes precedence and Status Lite remains dormant for that Wan2GP session. No Lite panel or duplicate Lite callback/download observers are installed.
 
 ## Live stage behavior
 

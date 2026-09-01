@@ -35,12 +35,12 @@ class LiteReleaseSmokeTests(unittest.TestCase):
         compile(download_source, str(DOWNLOAD_PATH), "exec")
         manifest = json.loads((ROOT / "plugin_info.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "Status Lite")
-        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(manifest["version"], "1.0.1")
         self.assertEqual(manifest["type"], "extension")
         self.assertEqual(manifest["wan2gp_version"], "0")
         self.assertIn('class StatusLitePlugin(WAN2GPPlugin):', source)
         self.assertIn('self.name = "Status Lite"', source)
-        self.assertIn('self.version = "1.0.0"', source)
+        self.assertIn('self.version = "1.0.1"', source)
         self.assertNotIn("Status Pro", download_source)
         self.assertIn("Status Lite", download_source)
 
@@ -96,6 +96,20 @@ class LiteReleaseSmokeTests(unittest.TestCase):
         ):
             self.assertIn(token, javascript)
         self.assertNotIn("splitMissedSlidingWindows", javascript)
+
+    def test_status_pro_takes_precedence_without_duplicate_observers(self):
+        source = _source()
+        javascript = _returned_string("_javascript")
+        self.assertIn('import builtins', source)
+        self.assertIn('_register_status_variant("lite")', source)
+        post_setup = source[source.index("    def post_ui_setup"):source.index("    @staticmethod", source.index("    def post_ui_setup"))]
+        self.assertLess(post_setup.index("_status_pro_registered()"), post_setup.index("install_download_observer()"))
+        self.assertLess(post_setup.index("_status_pro_registered()"), post_setup.index("self._install_step_observer()"))
+        self.assertIn('function disableForStatusPro(root)', javascript)
+        self.assertIn('root.querySelector("#status-pro-container")', javascript)
+        self.assertIn('function nativeStatusSource(root, container)', javascript)
+        self.assertIn('root.querySelector("#gen_status")', javascript)
+        self.assertNotIn('const source = container.previousElementSibling', javascript)
 
     def test_backend_has_only_live_bridges(self):
         source = _source()

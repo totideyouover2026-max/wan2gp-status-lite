@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 — 2026-09-01
+
+- Made simultaneous Status Pro and Status Lite installation safe: Pro takes precedence and Lite remains dormant without installing duplicate callback or download observers.
+- Resolved Wan2GP's native `gen_status` component directly, with an insertion-order-safe sibling fallback that skips either Status plugin container.
+
 ## 1.0.0 — 2026-09-01
 
 - Created Status Lite from the Status Pro 1.0.5 live stage engine.

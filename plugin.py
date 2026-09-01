@@ -1,3 +1,4 @@
+import builtins
 import json
 import os
 import threading
@@ -16,6 +17,27 @@ except Exception:  # Optional: Status Lite still works without process memory te
 from shared.utils.plugins import WAN2GPPlugin
 from shared.utils import prompt_parser
 from .download_telemetry import DOWNLOAD_TELEMETRY, install_download_observer
+
+
+_STATUS_VARIANT_REGISTRY_KEY = "_wan2gp_status_plugin_variants_v1"
+
+
+def _register_status_variant(variant: str) -> set:
+    """Advertise an enabled Status plugin variant within this Wan2GP process."""
+    variants = getattr(builtins, _STATUS_VARIANT_REGISTRY_KEY, None)
+    if not isinstance(variants, set):
+        variants = set()
+        setattr(builtins, _STATUS_VARIANT_REGISTRY_KEY, variants)
+    variants.add(str(variant or "").strip().lower())
+    return variants
+
+
+def _status_pro_registered() -> bool:
+    variants = getattr(builtins, _STATUS_VARIANT_REGISTRY_KEY, set())
+    return isinstance(variants, set) and "pro" in variants
+
+
+_register_status_variant("lite")
 
 
 RUN_SETTING_KEYS = (
@@ -788,7 +810,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "Status Lite"
-        self.version = "1.0.0"
+        self.version = "1.0.1"
         self.description = (
             "History-free pipeline timeline with stage timings and live ETA estimates."
         )
@@ -801,12 +823,6 @@ class StatusLitePlugin(WAN2GPPlugin):
         self._model_lifecycle_observer_installed = False
 
     def setup_ui(self):
-        try:
-            install_download_observer()
-        except Exception as exc:
-            # Download detail is optional. A changed Wan2GP/Hugging Face API
-            # must not prevent the core live status UI from loading.
-            print(f"[Status Lite] Download telemetry unavailable: {exc}")
         self.request_component("gen_status")
         self.request_component("state")
         self.request_global("get_model_name")
@@ -1080,8 +1096,21 @@ class StatusLitePlugin(WAN2GPPlugin):
             )
 
     def post_ui_setup(self, components: dict):
-        if self._insertion_registered or components.get("gen_status") is None:
+        if self._insertion_registered:
             return
+        if _status_pro_registered():
+            self._insertion_registered = True
+            print("[Status Lite] Status Pro detected; Status Lite is disabled for this session.")
+            return
+        if components.get("gen_status") is None:
+            return
+
+        try:
+            install_download_observer()
+        except Exception as exc:
+            # Download detail is optional. A changed Wan2GP/Hugging Face API
+            # must not prevent the core live status UI from loading.
+            print(f"[Status Lite] Download telemetry unavailable: {exc}")
 
         self._install_step_observer()
         self._install_postprocessing_step_observer()
@@ -3877,6 +3906,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function tick(namespace) {
+        if (disableForStatusPro(namespace.root)) return;
         if (!namespace.host.isConnected || !namespace.source.isConnected) return;
         observeRunOutcome(namespace, visibleFailureNotice(namespace));
         syncRunTelemetry(namespace);
@@ -3925,13 +3955,57 @@ class StatusLitePlugin(WAN2GPPlugin):
         root.appendChild(style);
     }
 
+    function nativeStatusSource(root, container) {
+        const nativeSource = root.querySelector("#gen_status");
+        if (nativeSource && nativeSource !== container) return nativeSource;
+        let candidate = container.previousElementSibling;
+        while (candidate && (
+            candidate.id === "status-pro-container" ||
+            candidate.id === "status-lite-container"
+        )) {
+            candidate = candidate.previousElementSibling;
+        }
+        return candidate;
+    }
+
+    function disableForStatusPro(root) {
+        if (!root.querySelector("#status-pro-container")) return false;
+        const namespace = window[NAMESPACE];
+        if (namespace && namespace.timer) {
+            window.clearInterval(namespace.timer);
+            namespace.timer = null;
+        }
+        if (namespace && namespace.resumeHandler) {
+            document.removeEventListener("visibilitychange", namespace.resumeHandler);
+            window.removeEventListener("focus", namespace.resumeHandler);
+        }
+        if (namespace && namespace.source) {
+            namespace.source.classList.remove("status-lite-source--active");
+        }
+        const container = root.querySelector("#status-lite-container");
+        const host = root.querySelector("#status-lite-host");
+        const panel = host && host.querySelector("[data-status-lite]");
+        if (container) {
+            container.classList.remove("status-lite-container--active");
+            container.hidden = true;
+        }
+        if (host) host.classList.remove("status-lite-host--active");
+        if (panel) panel.hidden = true;
+        if (!window.__wangpStatusLiteProNotice) {
+            window.__wangpStatusLiteProNotice = true;
+            console.info("[Status Lite] Status Pro detected; Lite is dormant for this session.");
+        }
+        return true;
+    }
+
     function bind() {
         const root = appRoot();
+        if (disableForStatusPro(root)) return true;
         const container = root.querySelector("#status-lite-container");
         const host = root.querySelector("#status-lite-host");
         if (!container || !host) return false;
         const panel = host.querySelector("[data-status-lite]");
-        const source = container.previousElementSibling;
+        const source = nativeStatusSource(root, container);
         if (!panel || !source) return false;
 
         installStyle(root);
