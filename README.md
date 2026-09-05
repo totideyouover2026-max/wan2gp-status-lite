@@ -9,7 +9,6 @@ It keeps the live experience:
 - Per-stage model/component details, including accurate LTX 2/2.5 post-processing identities
 - Multi-pass and sliding/subwindow awareness
 - Recovered stage and step telemetry after a window is minimized or backgrounded
-- Process RAM, VRAM, and GPU-memory observations
 - Model download file progress, transfer cycles, speed, and ETA
 - Model loading/unloading, abort, failure, and optional-stage handling
 - Responsive and collapsible layout
@@ -32,7 +31,7 @@ Status Lite and Status Pro are alternative presentations. You normally only need
 
 ## Live stage behavior
 
-Status Lite reads Wan2GP's native progress UI and a small plugin-owned telemetry bridge. The bridge supplies queue settings, model components, process/GPU memory, download activity, and callback step samples that the native progress text does not expose.
+Status Lite reads Wan2GP's native progress UI and a small plugin-owned telemetry bridge. The bridge supplies queue settings, model components, download activity, and callback step samples that the native progress text does not expose.
 
 Sliding windows and post-processing subwindows remain part of the same live task. Their observed steps are accumulated while the task runs; Status Lite does not split them into saved records.
 
