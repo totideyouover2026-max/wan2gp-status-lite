@@ -10,6 +10,8 @@ Stages appear only when relevant. Inputs, Enhance, and Save are optional; a mode
 
 Prepare shows the transformer or primary processing model. Inputs and Decode show the applicable VAE components. Encode shows the text encoder. Status Lite uses the task's actual processing metadata, so a gallery-applied LTX upscaler is shown as LTX rather than inheriting the model selected on the generation form.
 
+For gallery-applied LTX upscaling, `Distilled refinement` is part of Enhance. Inputs and Encode may appear between the initial upsampling setup and refinement; when Enhance resumes, its elapsed time includes that earlier Enhance work.
+
 ## Steps, passes, and subwindows
 
 The live counter accumulates callback observations for the active queue task. Multi-pass and LTX spatial-upscaler windows retain their phase/window labels. A two-window, eight-step upscaler can therefore show sixteen observations while still describing the configured work as two passes of eight steps.

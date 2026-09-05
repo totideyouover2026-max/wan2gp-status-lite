@@ -810,7 +810,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "Status Lite"
-        self.version = "1.0.1"
+        self.version = "1.0.0"
         self.description = (
             "History-free pipeline timeline with stage timings and live ETA estimates."
         )
@@ -1953,8 +1953,10 @@ class StatusLitePlugin(WAN2GPPlugin):
     function observeResourceSample(run, sample, includeInAverage = true) {
         if (!run || !sample || typeof sample !== "object") return;
         const sampledAt = optionalNumber(sample.sampled_at);
-        if (Number.isFinite(sampledAt) && sampledAt === run._last_resource_sample_at) return;
-        if (Number.isFinite(sampledAt)) run._last_resource_sample_at = sampledAt;
+        if (includeInAverage && Number.isFinite(sampledAt)) {
+            if (sampledAt <= (run._last_periodic_resource_sample_at ?? -Infinity)) return;
+            run._last_periodic_resource_sample_at = sampledAt;
+        }
         const resources = run.resources || {
             sample_count: 0,
             observation_count: 0,
@@ -2094,7 +2096,7 @@ class StatusLitePlugin(WAN2GPPlugin):
 
         if (/\b(?:denois|diffus|sampl|synthesis|synthes|generating\s+(?:audio|waveform|speech)|spectrum\s+smoothing\s+replay)/.test(name)) return "denoise";
         if (/(?:vae\s*decod|decod|reconstruct)/.test(name)) return "decode";
-        if (/(?:post.?process|upscal|upsampl|interpol|color correction|film grain|tcdecoder|seedvc|voice replacement|audio post|soundtrack|enhanc)/.test(name)) return "post";
+        if (/(?:post.?process|upscal|upsampl|spatial refin|distilled refinement|interpol|color correction|film grain|tcdecoder|seedvc|voice replacement|audio post|soundtrack|enhanc)/.test(name)) return "post";
         if (/(?:encod|prompt|condition|embed|feature|token)/.test(name)) return "encode";
         if (/(?:prepar|initial|load|download|queue|cache|start)/.test(name)) return "prepare";
         return "prepare";
@@ -2710,7 +2712,7 @@ class StatusLitePlugin(WAN2GPPlugin):
 
     function syncRunTelemetry(namespace) {
         const telemetry = readRunSnapshot(namespace);
-        if (!telemetry) return;
+        if (!telemetry || telemetry.error || typeof telemetry.in_progress !== "boolean") return;
         const task = telemetry.active_task && typeof telemetry.active_task === "object"
             ? telemetry.active_task
             : null;
@@ -2731,7 +2733,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             return;
         }
 
-        if (namespace.activeRun) {
+        if (namespace.activeRun && telemetry.in_progress === false) {
             observeRunOutcome(namespace, telemetry.status, relevantQueueError(telemetry, namespace.activeRun));
             finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
         }
@@ -3264,7 +3266,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             activeState.currentId = snapshot.id;
             const next = activeState.records[snapshot.id];
             const recoveredBaseline = next.recovered && next.state === "complete" && Number.isFinite(next.elapsed);
-            const elapsedBase = (recoveredBaseline || (snapshot.id === "input" && next.state === "complete" && Number.isFinite(next.elapsed)))
+            const resumableStage = ["input", "post"].includes(snapshot.id);
+            const elapsedBase = (recoveredBaseline || (resumableStage && next.state === "complete" && Number.isFinite(next.elapsed)))
                 ? next.elapsed
                 : 0;
             next.state = snapshot.aborting ? "aborting" : "current";
@@ -3905,13 +3908,19 @@ class StatusLitePlugin(WAN2GPPlugin):
         namespace.panel.hidden = !active;
     }
 
-    function tick(namespace) {
-        if (disableForStatusPro(namespace.root)) return;
-        if (!namespace.host.isConnected || !namespace.source.isConnected) return;
-        observeRunOutcome(namespace, visibleFailureNotice(namespace));
-        syncRunTelemetry(namespace);
-        observeRunOutcome(namespace, visibleFailureNotice(namespace));
-        readDownloadSnapshot(namespace);
+    function readLiveSnapshot(namespace) {
+        const telemetry = namespace.runTelemetry;
+        const downloading = namespace.download && namespace.download.active;
+        const lifecycle = telemetry && telemetry.model_lifecycle;
+        // Native status text and progress widgets can survive a stopped queue.
+        // Only explicit idle telemetry overrides them; keep the DOM fallback
+        // when the bridge is unavailable, and preserve independent asset work.
+        if (telemetry && telemetry.in_progress === false && !telemetry.active_task &&
+            !downloading) {
+            return lifecycle && lifecycle.state === "unloading"
+                ? modelLifecycleSnapshot(namespace)
+                : null;
+        }
         let snapshot = readPrepareStatus(namespace) || readReportedPreGenerationStatus(namespace) || readSnapshot(namespace);
         snapshot = reinterpretQwenSilentEncode(namespace, snapshot);
         if (!snapshot && namespace.download && namespace.download.visible &&
@@ -3929,6 +3938,17 @@ class StatusLitePlugin(WAN2GPPlugin):
                 textOnly: true
             };
         }
+        return snapshot;
+    }
+
+    function tick(namespace) {
+        if (disableForStatusPro(namespace.root)) return;
+        if (!namespace.host.isConnected || !namespace.source.isConnected) return;
+        observeRunOutcome(namespace, visibleFailureNotice(namespace));
+        syncRunTelemetry(namespace);
+        observeRunOutcome(namespace, visibleFailureNotice(namespace));
+        readDownloadSnapshot(namespace);
+        const snapshot = readLiveSnapshot(namespace);
         if (snapshot) {
             observeRunOutcome(namespace, snapshot.rawName, snapshot.rawMessage);
             recoverMissedPerformanceStages(namespace, snapshot);

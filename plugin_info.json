@@ -1,9 +1,9 @@
 {
   "name": "Status Lite",
   "author": "totideyouover2026-max",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "description": "Live stage-based status, ETA, downloads, model components, memory and step telemetry without generation history.",
-  "date": "2026-09-01",
+  "date": "2026-09-05",
   "wan2gp_version": "0",
   "type": "extension",
   "url": "https://github.com/totideyouover2026-max/wan2gp-status-lite"

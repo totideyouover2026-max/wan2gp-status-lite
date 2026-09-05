@@ -1,6 +1,6 @@
 # Wan2GP Status Lite
 
-Status Lite is the live, stage-based Wan2GP status panel from Status Pro, packaged for users who do not need generation history.
+Status Lite 1.0.0 is the live, stage-based Wan2GP status panel from Status Pro, packaged for users who do not need generation history.
 
 It keeps the live experience:
 
