@@ -195,6 +195,49 @@ def _telemetry_value(value, depth=0):
     return str(value)[:500]
 
 
+def _native_progress_snapshot(gen):
+    """Copy native phase progress without carrying counters across status transitions."""
+    import math
+    import re
+
+    def number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+            return result if math.isfinite(result) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    gen = gen if isinstance(gen, dict) else {}
+    phase_state = gen.get("progress_phase")
+    phase_state = phase_state if isinstance(phase_state, (list, tuple)) else ()
+    phase = str(phase_state[0] or "") if phase_state else ""
+    current = number(phase_state[1]) if len(phase_state) > 1 else None
+    result = {"phase": phase, "current": None, "total": None, "unit": None, "progress": None}
+    if current is None or current < 0:
+        return result
+    result["current"] = current
+    args = gen.get("last_progress_args")
+    args = args if isinstance(args, (list, tuple)) else ()
+    amount = args[0] if args and isinstance(args[0], (list, tuple)) else ()
+    units = gen.get("phase_progress_units")
+    units = units if isinstance(units, (list, tuple)) else ()
+    total = number(amount[1]) if len(amount) > 1 else None
+    unit = args[3] if len(args) > 3 and isinstance(args[3], str) else None
+    if total is None or total <= 0:
+        total = number(units[0]) if units else None
+        unit = units[1] if len(units) > 1 and isinstance(units[1], str) else None
+    elif not unit and len(units) > 1 and isinstance(units[1], str):
+        unit = units[1]
+    if (total is None or total <= 0) and re.search(r"\b(?:denois|diffus|sampl)\w*", phase, re.I):
+        total = number(gen.get("num_inference_steps"))
+        unit = "steps"
+    if total is not None and total > 0:
+        result.update(total=total, unit=unit or None, progress=max(0.0, min(100.0, current / total * 100)))
+    return result
+
+
 def _memory_snapshot(torch_module=None):
     """Return non-synchronizing process and active-device memory counters."""
     sample = {"sampled_at": time.time()}
@@ -927,6 +970,11 @@ class StatusLitePlugin(WAN2GPPlugin):
             @wraps(callback)
             def observed_callback(*callback_args, **callback_kwargs):
                 nonlocal last_step_at, last_skip_count, phase_index, next_sequence, current_total
+                progress_unit = callback_kwargs.get("progress_unit", callback_args[8] if len(callback_args) > 8 else None)
+                progress_title = callback_kwargs.get("progress_title", callback_args[10] if len(callback_args) > 10 else None)
+                # V13 encoder layers and VAE tiles are phase-local, not denoising.
+                if progress_title is not None:
+                    return callback(*callback_args, **callback_kwargs)
                 step_idx = callback_kwargs.get("step_idx", callback_args[0] if callback_args else -1)
                 force_refresh = callback_kwargs.get(
                     "force_refresh",
@@ -947,6 +995,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                     override_total = None
                 if override_total is not None:
                     current_total = override_total
+
+                if step_idx >= 0 and current_total is not None and step_idx >= current_total:
+                    return callback(*callback_args, **callback_kwargs)
 
                 now = time.perf_counter()
                 if step_idx >= 0:
@@ -1082,6 +1133,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 "total_windows": _telemetry_value(gen.get("total_windows")),
                 "status": str(gen.get("status") or "")[:2000],
                 "progress_phase": _telemetry_value(gen.get("progress_phase")),
+                "native_progress": _native_progress_snapshot(gen),
                 "queue_errors": _telemetry_value(gen.get("queue_errors") or {}),
                 "resource_sample": _memory_snapshot(getattr(self, "torch", None)) if gen.get("in_progress") else None,
                 "performance": _latest_performance_snapshot(gen, self._latest_performance),
@@ -2062,8 +2114,8 @@ class StatusLitePlugin(WAN2GPPlugin):
 
     function parseSteps(metaText) {
         const match = String(metaText || "").match(/(\d+)\s*\/\s*(\d+)(?:\s*steps?)?/i);
-        if (!match) return { current: null, total: null };
-        return { current: Number(match[1]), total: Number(match[2]) };
+        if (!match) return { current: null, total: null, unit: null };
+        return { current: Number(match[1]), total: Number(match[2]), unit: "steps" };
     }
 
     function parseProgressTiming(levelText) {
@@ -2183,7 +2235,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             selectedId: null,
             selectionIsManual: false,
             overallElapsed: null,
-            steps: { current: null, total: null },
+            steps: { current: null, total: null, unit: null },
             lastSeenAt: 0,
             inactiveSince: 0,
             jobStartedAt: Date.now()
@@ -2286,6 +2338,10 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!record || record.state !== "current") return;
         record.elapsed = (Date.now() - record.startedAt) / 1000;
         record.state = "complete";
+        if (Number.isFinite(record.total) && record.total > 0) {
+            record.current = record.total;
+            record.progress = 100;
+        }
     }
 
     function resetStageForNextDenoisePhase(state, id) {
@@ -2306,6 +2362,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         record.reportedElapsed = null;
         record.reportedAt = null;
         record.progress = null;
+        record.progressScope = null;
         record.eta = null;
         record.samples = [];
         record.stepCurrent = null;
@@ -2324,24 +2381,32 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function applyPhase(state, snapshot, now) {
+        if (snapshot.aborting && state.phases[state.currentPhaseId]) {
+            const active = state.phases[state.currentPhaseId];
+            active.state = "aborting";
+            active.elapsed = Math.max(0, (now - active.startedAt) / 1000);
+            return;
+        }
         const phase = phaseInfo(snapshot.rawName);
-        if (state.currentPhaseId !== phase.id) {
+        const previousPhase = state.phases[state.currentPhaseId];
+        if (!previousPhase || (previousPhase.phaseKey || previousPhase.id) !== phase.id || previousPhase.stage !== snapshot.id) {
             finishPhase(state);
             const isLaterDenoisePhase = phase.kind === "denoise" &&
                 Number.isFinite(phase.phaseNumber) &&
                 Number.isFinite(state.lastDenoisePhase) &&
                 phase.phaseNumber > state.lastDenoisePhase;
             if (isLaterDenoisePhase) resetDownstreamStagesForNextDenoisePhase(state);
-            state.currentPhaseId = phase.id;
-            state.phases[phase.id] = {
-                id: phase.id,
+            const phaseId = state.phases[phase.id] ? `${phase.id}:${state.phaseOrder.length}` : phase.id;
+            state.currentPhaseId = phaseId;
+            state.phases[phaseId] = {
+                id: phaseId, phaseKey: phase.id,
                 label: phase.label,
                 stage: snapshot.id,
                 startedAt: now,
                 elapsed: null,
                 state: snapshot.aborting ? "aborting" : "current"
             };
-            state.phaseOrder.push(phase.id);
+            state.phaseOrder.push(state.currentPhaseId);
         }
         if (phase.kind === "denoise" && Number.isFinite(phase.phaseNumber)) {
             state.activeDenoisePhase = phase.phaseNumber;
@@ -2350,12 +2415,16 @@ class StatusLitePlugin(WAN2GPPlugin):
         const record = state.phases[state.currentPhaseId];
         record.state = snapshot.aborting ? "aborting" : "current";
         record.elapsed = (now - record.startedAt) / 1000;
+        record.progress = snapshot.progress;
+        record.current = optionalNumber(snapshot.steps && snapshot.steps.current);
+        record.total = optionalNumber(snapshot.steps && snapshot.steps.total);
+        record.unit = snapshot.steps && snapshot.steps.unit || null;
     }
 
     function runStatusFrom(namespace, telemetry) {
         const field = namespace.source.querySelector("textarea, input");
         const message = `${String(telemetry && telemetry.status || "")} ${String(field && field.value || "")}`;
-        if (/\b(abort(?:ed|ing)?|cancel(?:led|ling)?|interrupt(?:ed|ing)?)\b/i.test(message)) return "aborted";
+        if (isStoppingStatus(message)) return "aborted";
         if (/\b(error|failed|failure|exception)\b/i.test(message)) return "failed";
         return "completed";
     }
@@ -2372,7 +2441,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!message) return;
         if (run.notice_baseline && message === run.notice_baseline) return;
 
-        const aborted = /\b(abort(?:ed|ing)?|cancel(?:led|ling)?|interrupt(?:ed|ing)?)\b/i.test(message);
+        const aborted = isStoppingStatus(message);
         const failed = /\b(error|failed|failure|exception|traceback|out of memory|oom|insufficient|unsufficient|tried to allocate)\b/i.test(message);
         if (failed) {
             run.outcome_status = "failed";
@@ -2753,7 +2822,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     function statusSnapshot(namespace, message) {
         message = String(message || "").trim();
         if (!message) return null;
-        const aborting = /\b(abort(?:ing|ed)?|cancel(?:ling|ed)?|interrupt(?:ing|ed)?)\b/i.test(message);
+        const aborting = isStoppingStatus(message);
         const loadWord = "(?:load(?:ing|ed)?|download(?:ing|ed)?)";
         const assetWord = "(?:models?|weights?|files?|assets?)";
         const modelActivity = new RegExp(
@@ -2825,9 +2894,9 @@ class StatusLitePlugin(WAN2GPPlugin):
         const telemetry = namespace.runTelemetry;
         const lifecycleSnapshot = modelLifecycleSnapshot(namespace);
         if (lifecycleSnapshot && lifecycleSnapshot.activity === "unload") return lifecycleSnapshot;
-        const phase = Array.isArray(telemetry && telemetry.progress_phase)
-            ? String(telemetry.progress_phase[0] || "")
-            : "";
+        const phase = String(telemetry && telemetry.native_progress && telemetry.native_progress.phase ||
+            (Array.isArray(telemetry && telemetry.progress_phase) ? telemetry.progress_phase[0] : "") || "");
+        if (isStoppingStatus(telemetry && telemetry.status)) return statusSnapshot(namespace, telemetry.status);
         if (phase && stageIdFor(phase) !== "prepare") {
             return null;
         }
@@ -2836,32 +2905,78 @@ class StatusLitePlugin(WAN2GPPlugin):
         return lifecycleSnapshot;
     }
 
-    function readReportedPreGenerationStatus(namespace) {
+    function isStoppingStatus(value) {
+        return /\b(?:abort(?:ing|ed)?|cancel(?:ling|led|ing|ed)?|interrupt(?:ing|ed)?|stopp?(?:ing|ed)?|early[ -]stop)\b/i.test(String(value || ""));
+    }
+
+    function formatCounter(steps) {
+        if (!steps || !Number.isFinite(steps.current) || !Number.isFinite(steps.total)) return "";
+        return `${steps.current}/${steps.total} ${steps.unit || "steps"}`;
+    }
+
+    function readReportedPhaseStatus(namespace) {
         if (!namespace.activeRun) return null;
         const telemetry = namespace.runTelemetry;
+        const native = telemetry && telemetry.native_progress;
         const reported = telemetry && telemetry.progress_phase;
-        const phase = Array.isArray(reported) ? String(reported[0] || "").trim() : "";
-        const id = stageIdFor(phase);
-        if (!phase || (id !== "input" && id !== "encode")) return null;
-        const currentId = namespace.state && namespace.state.currentId;
-        if (id === "encode" && currentId && !["prepare", "input", "encode"].includes(currentId)) return null;
-        if (id === "input" && currentId && ["decode", "post", "save"].includes(currentId)) return null;
+        const phase = String(native && native.phase || (Array.isArray(reported) ? reported[0] : "") || "").trim();
+        if (!phase) return null;
+        const aborting = isStoppingStatus(phase) || isStoppingStatus(telemetry && telemetry.status);
+        const id = aborting ? (namespace.state.currentId || stageIdFor(phase)) : stageIdFor(phase);
+        const current = optionalNumber(native && native.current);
+        const total = optionalNumber(native && native.total);
+        const measurable = current !== null && current >= 0 && total !== null && total > 0;
+        // Raw pre-V13 phase names retain their earlier, pre-generation fallback.
+        if (!native && !aborting) {
+            if (id !== "input" && id !== "encode") return null;
+            const currentId = namespace.state.currentId;
+            if (id === "encode" && currentId && !["prepare", "input", "encode"].includes(currentId)) return null;
+            if (id === "input" && currentId && ["decode", "post", "save"].includes(currentId)) return null;
+        }
         return {
-            id,
-            rawName: phase,
-            rawMessage: phase,
-            metaText: "",
-            stageElapsed: null,
-            nativeEta: null,
+            id, rawName: aborting ? "Aborting" : phase,
+            rawMessage: aborting ? String(telemetry.status || phase) : phase,
+            metaText: "", stageElapsed: null, nativeEta: null,
             overallElapsed: namespace.state.overallElapsed,
-            progress: null,
-            steps: { current: null, total: null },
-            aborting: false,
-            textOnly: true
+            progress: measurable && !aborting ? clamp(current / total * 100, 0, 100) : null,
+            steps: aborting ? namespace.state.steps : {current, total: measurable ? total : null, unit: native && native.unit || null},
+            progressScope: measurable ? "phase" : null,
+            aborting, textOnly: true
+        };
+    }
+
+    function readWangpSnapshot(namespace) {
+        const source = namespace.source;
+        const tracker = source.matches && source.matches(".wangp-progress")
+            ? source : source.querySelector(".wangp-progress");
+        if (!tracker) return null;
+        const value = selector => String((tracker.querySelector(selector) || {}).textContent || "").trim();
+        const rawName = value(".progress-title");
+        if (!rawName) return null;
+        const amount = value(".progress-amount").match(/(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*(.*)/);
+        const steps = amount ? {current: Number(amount[1]), total: Number(amount[2]), unit: amount[3].trim() || null}
+            : {current: null, total: null, unit: null};
+        const track = tracker.querySelector(".progress-track");
+        const aria = optionalNumber(track && track.getAttribute && track.getAttribute("aria-valuenow"));
+        const percent = value(".progress-percent").match(/(\d+(?:\.\d+)?)\s*%/);
+        const progress = aria ?? (percent ? Number(percent[1]) : (steps.total > 0 ? steps.current / steps.total * 100 : null));
+        const timing = parseProgressTiming(value(".progress-timing"));
+        const aborting = isStoppingStatus(rawName);
+        return {
+            id: aborting ? (namespace.state.currentId || stageIdFor(rawName)) : stageIdFor(rawName),
+            rawName, rawMessage: rawName, metaText: value(".progress-timing"),
+            stageElapsed: timing.elapsed, overallElapsed: namespace.state.overallElapsed,
+            nativeEta: Number.isFinite(timing.total) && Number.isFinite(timing.elapsed) ? Math.max(0, timing.total - timing.elapsed) : null,
+            progress: Number.isFinite(progress) && !aborting ? clamp(progress, 0, 100) : null,
+            steps: aborting ? namespace.state.steps : steps,
+            progressScope: steps.total > 0 && steps.current >= 0 ? "phase" : null,
+            aborting, textOnly: false
         };
     }
 
     function readSnapshot(namespace) {
+        const native = readWangpSnapshot(namespace);
+        if (native) return native;
         const tracker = findTracker(namespace);
         if (!tracker) return readStatusField(namespace);
         const level = tracker.querySelector(".progress-level-inner");
@@ -2892,7 +3007,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function reinterpretQwenSilentEncode(namespace, snapshot) {
-        if (!snapshot || snapshot.id !== "denoise") return snapshot;
+        if (!snapshot || snapshot.id !== "denoise" || snapshot.progressScope === "phase") return snapshot;
         const telemetry = namespace.runTelemetry;
         const task = telemetry && telemetry.active_task;
         const settings = task && task.settings;
@@ -2924,7 +3039,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             stageElapsed: encodingElapsed,
             nativeEta: null,
             progress: null,
-            steps: { current: null, total: null },
+            steps: { current: null, total: null, unit: null },
             textOnly: true
         };
     }
@@ -3303,9 +3418,10 @@ class StatusLitePlugin(WAN2GPPlugin):
         record.rawMessage = snapshot.rawMessage;
         record.activity = snapshot.activity || null;
         record.activityModel = String(snapshot.activityModel || "");
-        // WanGP exposes Decode as a blocking VAE operation. Its progress value is
-        // either a static 0% or the completed denoising bar, not decoder progress.
-        record.progress = snapshot.id === "decode" ? null : snapshot.progress;
+        // Legacy Decode can expose the completed denoising bar; only trust
+        // a coherent V13 phase counter as actual decoder progress.
+        record.progressScope = snapshot.progressScope || null;
+        record.progress = snapshot.id === "decode" && record.progressScope !== "phase" ? null : snapshot.progress;
         record.elapsed = (Number.isFinite(record.elapsedBase) ? record.elapsedBase : 0) +
             (now - record.startedAt) / 1000;
         record.reportedElapsed = Number.isFinite(snapshot.stageElapsed) ? snapshot.stageElapsed : null;
@@ -3320,11 +3436,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         updateStepTiming(record, snapshot.steps, now);
         if (snapshot.aborting) record.eta = null;
         else if (record.id === "denoise") updateDenoiseEta(record);
-        else updateEta(record);
+        else if (record.id === "post") updateEta(record);
+        else record.eta = null;
         activeState.overallElapsed = snapshot.overallElapsed;
         const denoise = activeState.records.denoise;
-        activeState.steps = snapshot.id === "decode" && Number.isFinite(denoise.stepTotal)
-            ? { current: denoise.stepTotal, total: denoise.stepTotal }
+        activeState.steps = snapshot.id === "decode" && snapshot.progressScope !== "phase" && Number.isFinite(denoise.stepTotal)
+            ? { current: denoise.stepTotal, total: denoise.stepTotal, unit: "steps" }
             : snapshot.steps;
     }
 
@@ -3688,7 +3805,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function stageActivities(state, record) {
-        if (!record || record.id !== "input") return [];
+        if (!record || !["input", "encode", "denoise", "decode", "post"].includes(record.id)) return [];
         const seen = new Set();
         return state.phaseOrder
             .filter(id => {
@@ -3697,11 +3814,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                 return true;
             })
             .map(id => state.phases[id])
-            .filter(phase => phase && phase.stage === "input")
+            .filter(phase => phase && phase.stage === record.id)
             .map(phase => ({
                 label: phase.label,
                 state: phase.state,
-                elapsed: phase.elapsed
+                elapsed: phase.elapsed,
+                current: phase.current, total: phase.total, unit: phase.unit, progress: phase.progress
             }));
     }
 
@@ -3709,12 +3827,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (record.preloaded) return record.rawMessage || "The required model was already loaded and ready for this run.";
         if (record.unreported) return record.rawMessage || "Wan2GP did not expose a separately measurable status for this stage.";
         if (record.state === "complete") {
-            if (record.id === "input" && hasActivities) return "";
+            if (hasActivities) return "";
             return Number.isFinite(record.elapsed) ? `Completed in ${formatDuration(record.elapsed)}.` : "Completed.";
         }
         if (record.state === "aborting") return record.rawMessage || "Wan2GP is stopping the current run.";
         if (/^unload/.test(String(record.activity || ""))) return record.rawMessage;
-        if (record.id === "decode" && record.state === "current") {
+        if (record.id === "decode" && record.state === "current" && record.progressScope !== "phase") {
             return "Decoding is running. Wan2GP does not report intermediate VAE progress for this model.";
         }
         let message = String(record.rawMessage || "").trim();
@@ -3724,7 +3842,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         }
         message = message.replace(/\s+-\s+/g, " · ");
         if (message) return message;
-        if (record.id === "input" && hasActivities) return "";
+        if (hasActivities) return "";
         if (record.state === "pending") return "This stage has not started.";
         return "Live stage timing.";
     }
@@ -3807,7 +3925,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                 const timing = Number.isFinite(activity.elapsed)
                     ? `${formatDuration(activity.elapsed)}${active ? " elapsed" : ""}`
                     : (active ? "Running" : "Completed");
-                line.textContent = `${icon} ${activity.label} · ${timing}`;
+                const counter = formatCounter(activity);
+                line.textContent = `${icon} ${activity.label}${counter ? ` · ${counter}` : ""} · ${timing}`;
                 activityElement.appendChild(line);
             });
         }
@@ -3846,7 +3965,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const etaMetric = namespace.panel.querySelector("[data-sp-eta-metric]");
         if (etaMetric) etaMetric.hidden = selected.state !== "current" || !stageSupportsEta(selected);
         const progressMetric = namespace.panel.querySelector("[data-sp-progress-metric]");
-        if (progressMetric) progressMetric.hidden = selected.id === "decode" || /^unload/.test(String(selected.activity || ""));
+        if (progressMetric) progressMetric.hidden = (selected.id === "decode" && selected.progressScope !== "phase") || /^unload/.test(String(selected.activity || ""));
         const stepMetric = namespace.panel.querySelector("[data-sp-step-metric]");
         if (stepMetric) {
             const showStepTime = (selected.id === "denoise" || selected.id === "post") &&
@@ -3879,7 +3998,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (idle) idle.hidden = true;
         if (running) running.hidden = false;
         text(namespace.panel, "[data-sp-live]", downloading ? "Downloading model files" : (current ? (current.rawName || current.label) : "Waiting for progress"));
-        text(namespace.panel, "[data-sp-steps]", Number.isFinite(state.steps.current) && Number.isFinite(state.steps.total) ? `${state.steps.current}/${state.steps.total} steps` : "");
+        text(namespace.panel, "[data-sp-steps]", formatCounter(state.steps));
         text(namespace.panel, "[data-sp-overall]", Number.isFinite(state.overallElapsed) ? `${formatDuration(state.overallElapsed)} elapsed` : "");
         const downloadEta = downloading ? downloadHeaderEta(namespace.download) : null;
         const eta = downloading ? downloadEta : totalEta(state);
@@ -3890,7 +4009,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const overallFill = namespace.panel.querySelector("[data-sp-overall-fill]");
         if (overallFill) {
             const stageIsIndeterminate = current && current.state === "current" &&
-                (current.id === "decode" || current.activity === "unload");
+                ((current.id === "decode" && current.progressScope !== "phase") || current.activity === "unload");
             overallFill.classList.toggle("status-lite__overall-fill--indeterminate", Boolean(stageIsIndeterminate));
             overallFill.style.width = !stageIsIndeterminate && current && Number.isFinite(current.progress)
                 ? `${current.progress}%`
@@ -3921,7 +4040,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                 ? modelLifecycleSnapshot(namespace)
                 : null;
         }
-        let snapshot = readPrepareStatus(namespace) || readReportedPreGenerationStatus(namespace) || readSnapshot(namespace);
+        let snapshot = readPrepareStatus(namespace);
+        if (!snapshot && !downloading) snapshot = readReportedPhaseStatus(namespace) || readSnapshot(namespace);
+        if (snapshot && isStoppingStatus(snapshot.rawName)) {
+            snapshot = {...snapshot, id: namespace.state.currentId || snapshot.id,
+                aborting: true, progress: null, steps: namespace.state.steps};
+        }
         snapshot = reinterpretQwenSilentEncode(namespace, snapshot);
         if (!snapshot && namespace.download && namespace.download.visible &&
             (namespace.download.active || namespace.state.currentId === "prepare")) {

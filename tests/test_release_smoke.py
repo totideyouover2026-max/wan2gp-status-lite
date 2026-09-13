@@ -148,7 +148,7 @@ class LiteReleaseSmokeTests(unittest.TestCase):
 const {readLiveSnapshot} = globalThis.__statusProReleaseTest;
 const namespace = {
   state: {currentId: null, overallElapsed: null, steps: {}, records: {}},
-  source: {querySelector: () => ({value: "Aborting"}), querySelectorAll: () => []},
+  source: {querySelector: selector => selector === "textarea, input" ? {value: "Aborting"} : null, querySelectorAll: () => []},
   download: {active: false, visible: false},
   runTelemetry: {in_progress: true, active_task: {id: 1}, status: "Aborting"}
 };
@@ -175,7 +175,7 @@ namespace.download.active = false;
 namespace.runTelemetry = {in_progress: true, active_task: {id: 2}, status: "Loading model"};
 check(readLiveSnapshot(namespace).rawName === "Loading model", "next queued run was hidden");
 namespace.runTelemetry = null;
-namespace.source.querySelector = () => ({value: "Aborting"});
+namespace.source.querySelector = selector => selector === "textarea, input" ? {value: "Aborting"} : null;
 check(readLiveSnapshot(namespace).aborting, "missing telemetry disabled DOM fallback");
 '''
         result = subprocess.run(
