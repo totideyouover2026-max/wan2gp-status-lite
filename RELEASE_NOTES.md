@@ -1,19 +1,21 @@
-# Status Lite 1.0.0
+# Status Lite 1.1.0
 
-Status Lite delivers Status Pro's live stage timeline for users who do not need generation history.
+Status Lite 1.1.0 adds WanGP V13 compatibility to the lightweight, live-only Status panel.
 
-## Included in the initial release
+## What's new
 
-- Selectable stages, live timings and ETA, model/component identities, LTX post-processing detail, multi-pass/subwindow step observations, download progress, and recovery after the window has been minimized.
-- Gallery-applied LTX 2/2.5 `Distilled refinement` stays in Enhance and preserves the earlier upsampling-start time across Inputs and Encode.
-- A stopped queue no longer revives Prepare from lingering abort text or completed asset activity. Active downloads and model unloading remain visible.
-- Temporary or incomplete telemetry snapshots preserve the active generation until valid completion telemetry arrives.
-- Safe coexistence with Status Pro: Pro takes precedence when both are enabled, and Lite remains dormant without installing duplicate observers or a competing panel.
-- WanGP's native status component is resolved independently of plugin insertion order.
-- An independent plugin identity, responsive layout, and collapsed/expanded preference.
+- Native WanGP phase state now takes priority, with V13 WangpProgress and legacy progress markup retained as fallbacks.
+- Unit-aware counters can show text-encoder layers, VAE tiles, and denoising steps.
+- Richer activities appear inside Inputs, Encode, Generate, Decode, and Enhance while the same seven-stage timeline remains unchanged.
+- Repeated prompts, passes, and windows remain individually visible.
+- Genuine V13 VAE Decode progress is displayed when available. Older blocking Decode operations continue to show elapsed activity without an invented percentage or ETA.
+- Layer and tile callbacks remain separate from denoising step timing, cache-skip observations, and phase numbering.
+- Cancellation, minimized-window recovery, Qwen Encode fallback, and safe coexistence with Status Pro remain supported.
+
+Older WanGP releases continue to work through the legacy fallback, though they may naturally provide fewer phase details.
 
 ## Live-only operation
 
-Completed-run data is not retained. There is no history UI, prompt memory, run import/export, or gallery navigation from prior runs. The ephemeral task object is discarded as soon as Wan2GP reports the task complete. Only the panel's collapsed/expanded preference is stored locally.
+Status Lite does not save completed runs and has no generation History, prompt retention, run import/export, or previous-run gallery navigation. Temporary task data is discarded when WanGP reports completion. Only the panel's collapsed or expanded preference is stored locally.
 
-Status Lite and Status Pro are alternative presentations, so most users only need one. Keeping both installed is supported; disable Pro and restart Wan2GP whenever you want Lite to become the active edition.
+Status Pro takes priority when both editions are enabled, leaving Lite dormant without duplicate observers or a competing panel.

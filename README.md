@@ -1,11 +1,11 @@
 # Wan2GP Status Lite
 
-Status Lite 1.0.0 is the live, stage-based Wan2GP status panel from Status Pro, packaged for users who do not need generation history.
+Status Lite 1.1.0 is the live, stage-based Wan2GP status panel from Status Pro, packaged for users who do not need generation history.
 
 It keeps the live experience:
 
 - Selectable Prepare, Inputs, Encode, Generate, Decode, Enhance, and Save stages
-- Live elapsed time, progress, step count, rolling step speed, and ETA
+- Live elapsed time, unit-aware step/layer/tile counters, rolling step speed, and ETA where appropriate
 - Per-stage model/component details, including accurate LTX 2/2.5 post-processing identities
 - Multi-pass and sliding/subwindow awareness
 - Recovered stage and step telemetry after a window is minimized or backgrounded
@@ -31,11 +31,13 @@ Status Lite and Status Pro are alternative presentations. You normally only need
 
 ## Live stage behavior
 
-Status Lite reads Wan2GP's native progress UI and a small plugin-owned telemetry bridge. The bridge supplies queue settings, model components, download activity, and callback step samples that the native progress text does not expose.
+Status Lite uses WanGP V13's native phase state first and retains nearby WangpProgress and legacy Gradio progress as compatibility fallbacks. Rich activities such as `Encoding Text Prompt · 50/50 layers`, `Denoising · 8/8 steps`, and `VAE Decoding · 28/28 tiles` remain inside the existing seven-stage timeline. Phase-local layer and tile counters stay separate from denoising step timing, cache-skip observations, and phase numbering.
 
 Sliding windows and post-processing subwindows remain part of the same live task. Their observed steps are accumulated while the task runs; Status Lite does not split them into saved records.
 
 If the browser or app window is minimized, Gradio may pause visible DOM updates. When the window returns, Status Lite reconciles the backend step samples and rebuilds any stages it missed while backgrounded.
+
+Cancellation and Qwen Encode recovery continue to use the active stage correctly. Older WanGP releases remain supported, though they may naturally provide less detailed progress.
 
 ## Privacy and storage
 

@@ -6,6 +6,10 @@ The header reports the current Wan2GP activity, total elapsed time, observed gen
 
 Stages appear only when relevant. Inputs, Enhance, and Save are optional; a model or workflow that does not report one of them will not be forced to display it as active work.
 
+WanGP V13 can provide activity counters such as `Encoding Text Prompt · 50/50 layers`, `Denoising · 8/8 steps`, and `VAE Decoding · 28/28 tiles`. These activities remain inside the existing seven top-level stages. Inputs, Encode, Generate, Decode, and Enhance can each show their detailed sub-activities, including repeated prompts, passes, or windows.
+
+Status Lite prefers WanGP's native phase information, with V13 WangpProgress and older progress markup retained as fallbacks. Layer and tile counters do not affect denoising step speed, cache-skip observations, or phase numbers. Genuine V13 Decode progress is shown when available; older workflows without it continue to show elapsed Decode activity.
+
 ## Model and component details
 
 Prepare shows the transformer or primary processing model. Inputs and Decode show the applicable VAE components. Encode shows the text encoder. Status Lite uses the task's actual processing metadata, so a gallery-applied LTX upscaler is shown as LTX rather than inheriting the model selected on the generation form.
@@ -38,3 +42,4 @@ After a task completes, its temporary settings and performance samples are disca
 - If Status Lite and Status Pro are both enabled, Status Pro takes precedence and Lite intentionally does not display or install its observers. Disable Pro and restart Wan2GP to use Lite instead.
 - If download detail is unavailable after an upstream Wan2GP change, generation-stage tracking should still operate.
 - If a stage says Wan2GP did not report intermediate progress, the underlying model or workflow did not expose a finer-grained callback for that stage.
+- Older WanGP releases remain supported, but may provide fewer phase details and counters than V13.
