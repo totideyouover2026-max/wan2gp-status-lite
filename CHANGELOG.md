@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 — 2026-09-14
+
+- Fixed WanGP V13 model, module, and LoRA downloads that could fail because the download observer accepted only the older two-argument call.
+- The observer now forwards all native download arguments unchanged, preserving progress generators, filename display settings, future options, and compatibility with older WanGP releases.
+- Fixed YuE2 score and semantic-audio token progress creating large numbers of duplicate live activities.
+- Token, tile, and layer progress is now phase-local telemetry rather than denoising step performance, and YuE2 audio decoding appears under Decode.
+
 ## 1.1.0 — 2026-09-13
 
 - Added WanGP V13 native phase progress, nearby WangpProgress support, and unit-aware step, layer, and tile counters within the existing seven-stage timeline. Legacy WanGP progress remains supported.

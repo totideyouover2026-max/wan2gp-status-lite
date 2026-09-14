@@ -66,6 +66,12 @@ class V13CompatibilityTests(unittest.TestCase):
         performance = owner._latest_performance
         baseline = copy.deepcopy(performance)
         read_count = len(reads)
+        for unit in ("tokens", "tiles", "layers"):
+            kwargs = dict(step_idx=0, progress_title=None, progress_unit=unit,
+                          override_num_inference_steps=4096, denoising_extra="YuE2 semantic audio")
+            self.assertEqual(callback(**kwargs), "original-result")
+            self.assertEqual(performance, baseline)
+            self.assertEqual(len(reads), read_count)
         for title, unit in [("Encoding Text Prompt", "layers"), ("Encoding Text Prompt 1/2", "layers"),
                             ("VAE Encoding", "tiles"), ("VAE Decoding", "tiles"), ("", "tiles")]:
             for step in [0, -1]:
@@ -78,15 +84,18 @@ class V13CompatibilityTests(unittest.TestCase):
         callback(*positional)
         self.assertEqual(forwarded[-1], (positional, {}))
         self.assertEqual(performance, baseline)
-        callback(0)
+        callback(step_idx=0, progress_unit="steps", denoising_extra="YuE2 acoustic synthesis")
         self.assertEqual(len(performance["steps"]), 1)
         self.assertEqual(performance["steps"][0]["total_steps"], 30)
+        self.assertEqual(performance["steps"][0]["label"], "YuE2 acoustic synthesis")
         callback(30)  # Pre-V13 Decode sentinel.
         self.assertEqual(len(performance["steps"]), 1)
         callback(-1)
         self.assertEqual(performance["callback_phase"], 1)
         callback(step_idx=1, override_num_inference_steps=40, progress_title=None)
         self.assertEqual(performance["steps"][-1]["total_steps"], 40)
+        callback(step_idx=2, progress_unit="step")
+        self.assertEqual(performance["steps"][-1]["step"], 3)
 
     def test_coexistence_registry_and_lite_observer_guard(self):
         names = ["_register_status_variant"]
@@ -115,6 +124,7 @@ class V13CompatibilityTests(unittest.TestCase):
             "freshState", "readLiveSnapshot", "readSnapshot", "readReportedPhaseStatus", "stageIdFor",
             "applySnapshot", "stageActivities", "finishPhase", "formatCounter", "stageSupportsEta",
             "reinterpretQwenSilentEncode", "renderDetail", "STAGE_DEFS", "recoveredPerformanceGroups",
+            "normalizedPhaseLabel",
         )
         script = r"""
 const api = globalThis.__statusProReleaseTest;
@@ -159,6 +169,23 @@ for (const phase of ["Preparing Conditioning", "Encoding Text Prompt 1/2", "Prep
     api.applySnapshot(repeated, native(repeated, phase));
 }
 assert(api.stageActivities(repeated.state, repeated.state.records.encode).length === 4, "repeated subphase overwritten");
+const yue = namespace();
+for (const count of [41, 81, 121]) {
+    api.applySnapshot(yue, native(yue, `Denoising | YuE2 semantic audio: ${count} tokens`, count, 9000, "tokens"));
+}
+let yueActivities = api.stageActivities(yue.state, yue.state.records.denoise);
+assert(yueActivities.length === 1, "YuE2 semantic-audio token updates created duplicate activities");
+assert(yueActivities[0].label === "Denoising | YuE2 semantic audio", "YuE2 semantic-audio label retained its counter");
+assert(yueActivities[0].current === 121 && yueActivities[0].total === 9000, "YuE2 semantic-audio counter did not advance");
+for (const count of [1806, 2302]) {
+    api.applySnapshot(yue, native(yue, `Denoising | YuE2 score: ${count} tokens`, count, 4096, "tokens"));
+}
+yueActivities = api.stageActivities(yue.state, yue.state.records.denoise);
+assert(yueActivities.length === 2, "YuE2 score token updates created duplicate activities");
+assert(yueActivities[1].current === 2302 && yueActivities[1].label === "Denoising | YuE2 score", "YuE2 score did not retain one advancing activity");
+assert(api.stageIdFor("YuE2 acoustic synthesis") === "denoise", "YuE2 acoustic synthesis left Generate");
+assert(api.stageIdFor("Denoising | YuE2 audio decoding") === "decode", "YuE2 audio decoding did not map to Decode");
+assert(api.normalizedPhaseLabel("Phase 2", {current: 2, total: 4, unit: "steps"}) === "Phase 2", "legitimate phase number was stripped");
 for (const initial of ["VAE Encoding", "Encoding Text Prompt"]) {
     for (const stop of ["Aborting", "Cancelling", "Interrupting", "Stopping", "Early-stop processing"]) {
         const ns = namespace();

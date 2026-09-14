@@ -457,12 +457,14 @@ class DownloadObserver:
             return result
 
         @functools.wraps(original_download_file)
-        def observed_download_file(url: str, filename: str) -> Any:
+        def observed_download_file(*args: Any, **kwargs: Any) -> Any:
+            url = kwargs.get("url", args[0] if len(args) > 0 else "")
+            filename = kwargs.get("filename", args[1] if len(args) > 1 else "")
             name = _clean_name(filename or url)
             telemetry.begin_batch([name], label="Model assets")
             telemetry.begin_file(name, source="Download")
             try:
-                result = original_download_file(url, filename)
+                result = original_download_file(*args, **kwargs)
             except Exception as exc:
                 telemetry.fail_file(name, exc)
                 telemetry.end_batch([name], error=str(exc))
