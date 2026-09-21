@@ -111,7 +111,8 @@ class V13CompatibilityTests(unittest.TestCase):
             self.assertIn(token, _source())
         scope = python_helpers(
             "_configured_task_value", "_effective_media_value", "has_effective_media_input",
-            "_task_has_input_media", "_task_has_enhancement", "plan_stages_for_task"
+            "_task_has_input_media", "_task_has_enhancement", "_task_model_type", "_task_is_h3",
+            "_task_is_yue2", "_task_is_yue2_hum", "plan_stages_for_task"
         )
         scope["PLANNED_STAGE_IDS"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
         scope["TASK_INPUT_MEDIA_KEYS"] = {
@@ -138,6 +139,17 @@ class V13CompatibilityTests(unittest.TestCase):
         combined = plan({"params": {"image_refs": ["ref.png"], "video_guide": "guide.mp4",
                                      "audio_guide2": {"path": "voice.wav", "meta": {"_type": "FileData"}}}})
         self.assertEqual(combined.count("input"), 1)
+        h3_media = {"params": {"model_type": "minimax_h3_ref2va_pruned", "image_refs": ["ref.png"],
+                               "video_guide": "guide.mp4", "audio_guide": "voice.wav"}}
+        self.assertEqual(plan(h3_media), ["prepare", "encode", "denoise", "decode", "save"])
+        self.assertEqual(
+            plan({"params": {"model_type": "yue2"}}),
+            ["prepare", "denoise", "decode", "save"],
+        )
+        self.assertEqual(
+            plan({"params": {"model_type": "yue2_hum", "audio_guide": "hum.wav"}}),
+            ["prepare", "input", "denoise", "decode", "save"],
+        )
         enhanced = {"params": {"model_type": "flux", "image_start": "start.png", "spatial_upsampling": "ltx252"}}
         self.assertEqual(
             plan(enhanced, {"settings": enhanced["params"]}),
@@ -241,7 +253,10 @@ class V13CompatibilityTests(unittest.TestCase):
 
 
     def test_server_stage_timing_is_monotonic_repeated_and_task_scoped(self):
-        scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_install_generation_timing_observer")
+        scope = python_helpers(
+            "_StageTimingTelemetry", "_structured_stage_id", "_task_model_type", "_task_is_yue2",
+            "_task_owned_stage_id", "_install_generation_timing_observer"
+        )
         scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
         scope["STRUCTURED_PHASE_STAGE_RULES"] = (
             ("input", ("vae encoding",)), ("encode", ("encoding prompt", "encoding text prompt")),
@@ -343,13 +358,91 @@ class V13CompatibilityTests(unittest.TestCase):
         self.assertTrue(b_snapshot["stages"]["denoise"]["completed"])
         self.assertNotIn("save", b_snapshot["stages"])
 
+    def test_yue2_model_phases_override_generic_decode_heuristic(self):
+        scope = python_helpers(
+            "_StageTimingTelemetry", "_structured_stage_id", "_task_model_type", "_task_is_yue2",
+            "_task_owned_stage_id", "_install_step_observer", "_new_performance_observer", "_telemetry_value"
+        )
+        scope.update(_skip_count=lambda pipe: 0, _memory_snapshot=lambda torch: {}, MAX_STEP_TELEMETRY=300)
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["STRUCTURED_PHASE_STAGE_RULES"] = (
+            ("input", ("encoding hum carrier",)),
+            ("decode", ("vae decoding", "yue2 audio decoding")),
+            ("denoise", ("generating audio", "yue2 score", "yue2 semantic audio", "yue2 acoustic synthesis")),
+        )
+        owned = scope["_task_owned_stage_id"]
+        yue = {"params": {"model_type": "yue2"}}
+        hum = {"params": {"model_type": "yue2_hum"}}
+        flux = {"params": {"model_type": "flux"}}
+        self.assertEqual(owned(yue, "Generating Audio"), "denoise")
+        self.assertEqual(owned(yue, "YuE2 score"), "denoise")
+        self.assertEqual(owned(yue, "YuE2 semantic audio"), "denoise")
+        self.assertIsNone(owned(yue, "VAE Decoding"))
+        self.assertEqual(owned(yue, "YuE2 acoustic synthesis"), "denoise")
+        self.assertEqual(owned(yue, "YuE2 audio decoding"), "decode")
+        self.assertEqual(owned(flux, "VAE Decoding"), "decode")
+        self.assertEqual(owned(hum, "Encoding Hum Carrier"), "input")
+
+        timer = scope["_StageTimingTelemetry"]()
+        epoch = timer.start_task("yue", now=0)
+        timer.observe_stage("yue", owned(yue, "YuE2 score"), now=1, execution_epoch=epoch)
+        timer.observe_stage("yue", owned(yue, "YuE2 semantic audio"), now=2, execution_epoch=epoch)
+        generic = owned(yue, "VAE Decoding")
+        if generic:
+            timer.observe_stage("yue", generic, now=3, execution_epoch=epoch)
+        timer.observe_stage("yue", owned(yue, "YuE2 acoustic synthesis"), now=4, execution_epoch=epoch)
+        intermediate = timer.snapshot("yue", now=5)["stages"]
+        self.assertTrue(intermediate["denoise"]["active"])
+        self.assertNotIn("decode", intermediate)
+        timer.observe_stage("yue", owned(yue, "YuE2 audio decoding"), now=6, execution_epoch=epoch)
+        final = timer.snapshot("yue", now=7)["stages"]
+        self.assertTrue(final["denoise"]["completed"])
+        self.assertTrue(final["decode"]["active"])
+
+        gen = {"api_active_queue_task": {"id": "callback-yue", "params": {"model_type": "yue2"}},
+               "queue": [], "progress_phase": ["YuE2 semantic audio", 200]}
+        state = {"gen": gen}
+        next_phase = ["VAE Decoding"]
+        def callback_impl(*args, **kwargs):
+            gen["progress_phase"] = [next_phase[0], kwargs.get("step_idx", 0)]
+        callback_timer = scope["_StageTimingTelemetry"]()
+        callback_timer.start_task("callback-yue", now=0)
+        callback_timer.observe_stage("callback-yue", "denoise", now=1)
+        owner = types.SimpleNamespace(
+            _step_observer_installed=False, _stage_timing=callback_timer,
+            build_callback=lambda *args, **kwargs: callback_impl,
+        )
+        owner.set_global = lambda name, value: setattr(owner, name, value)
+        scope["_install_step_observer"](owner)
+        callback = owner.build_callback(state, types.SimpleNamespace(cache=None), num_inference_steps=200)
+        callback(step_idx=199, progress_unit="tokens", denoising_extra="YuE2 semantic audio")
+        self.assertNotIn("decode", callback_timer.snapshot("callback-yue", now=2)["stages"])
+        next_phase[0] = "YuE2 acoustic synthesis"
+        callback(step_idx=0, progress_unit="steps", denoising_extra="YuE2 acoustic synthesis")
+        self.assertTrue(callback_timer.snapshot("callback-yue", now=3)["stages"]["denoise"]["active"])
+        next_phase[0] = "YuE2 audio decoding"
+        callback(step_idx=0, progress_unit="tiles", denoising_extra="YuE2 audio decoding")
+        self.assertTrue(callback_timer.snapshot("callback-yue", now=4)["stages"]["decode"]["active"])
+
+    def test_model_unload_component_calls_share_one_lifecycle_session(self):
+        lifecycle = python_helpers("_ModelLifecycleTelemetry")["_ModelLifecycleTelemetry"]()
+        first = lifecycle.begin_unload("flux", "Flux")
+        second = lifecycle.begin_unload("flux", "Flux VAE")
+        self.assertEqual(first, second)
+        lifecycle.finish_unload(first)
+        self.assertEqual(lifecycle.snapshot()["state"], "unloading")
+        lifecycle.finish_unload(second)
+        self.assertEqual(lifecycle.snapshot()["state"], "unloaded")
+        third = lifecycle.begin_unload("flux", "Extensions")
+        self.assertEqual(first, third)
+
 
     def test_native_dom_sequences_decode_cancellation_and_qwen(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("Node is required for V13 frontend validation")
         javascript = _javascript_with_exports(
-            "freshState", "readLiveSnapshot", "readSnapshot", "readReportedPhaseStatus", "stageIdFor",
+            "freshState", "readLiveSnapshot", "readSnapshot", "readReportedPhaseStatus", "stageIdFor", "structuredStageId",
             "applySnapshot", "stageActivities", "finishPhase", "formatCounter", "stageSupportsEta",
             "reinterpretQwenSilentEncode", "renderDetail", "STAGE_DEFS", "recoveredPerformanceGroups",
             "normalizedPhaseLabel",
@@ -411,8 +504,10 @@ for (const count of [1806, 2302]) {
 yueActivities = api.stageActivities(yue.state, yue.state.records.denoise);
 assert(yueActivities.length === 2, "YuE2 score token updates created duplicate activities");
 assert(yueActivities[1].current === 2302 && yueActivities[1].label === "Denoising | YuE2 score", "YuE2 score did not retain one advancing activity");
+assert(api.stageIdFor("YuE2 score") === "denoise", "YuE2 score left Generate");
 assert(api.stageIdFor("YuE2 acoustic synthesis") === "denoise", "YuE2 acoustic synthesis left Generate");
 assert(api.stageIdFor("Denoising | YuE2 audio decoding") === "decode", "YuE2 audio decoding did not map to Decode");
+assert(api.structuredStageId("Encoding Hum Carrier") === "input", "Hum carrier did not map to Inputs");
 assert(api.normalizedPhaseLabel("Phase 2", {current: 2, total: 4, unit: "steps"}) === "Phase 2", "legitimate phase number was stripped");
 for (const initial of ["VAE Encoding", "Encoding Text Prompt"]) {
     for (const stop of ["Aborting", "Cancelling", "Interrupting", "Stopping", "Early-stop processing"]) {
