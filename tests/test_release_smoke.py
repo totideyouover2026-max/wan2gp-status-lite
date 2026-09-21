@@ -407,7 +407,8 @@ api.applySnapshot(aborting,snap("denoise","Aborting","structured",true));
 ok(aborting.state.records.denoise.hasCompleted&&aborting.state.records.denoise.state==="aborting","repeat-pass abort erased completion");
 ok(aborting.state.records.decode.hasCompleted&&aborting.state.records.post.hasCompleted,"abort erased earlier stages");
 api.startRun(ns,{id:"B",settings:{}},{server_time:2});
-ok(Object.values(ns.state.records).every(r=>!r.hasRun&&!r.hasCompleted&&!r.isActive),"new task inherited stage history");
+ok(ns.state.currentId==="prepare"&&ns.state.records.prepare.isActive,"new task did not activate Prepare");
+ok(Object.values(ns.state.records).filter(r=>r.id!=="prepare").every(r=>!r.hasRun&&!r.hasCompleted&&!r.isActive),"new task inherited stage history");
 """
         result = subprocess.run([node, "-"], input=javascript + "\n" + script,
                                 text=True, encoding="utf-8", capture_output=True, check=False)
@@ -420,7 +421,7 @@ ok(Object.values(ns.state.records).every(r=>!r.hasRun&&!r.hasCompleted&&!r.isAct
             self.skipTest("Node is required for stage-presentation validation")
         javascript = _javascript_with_exports(
             "freshState", "applySnapshot", "renderStages", "readLiveSnapshot", "structuredStageId",
-            "applyServerStagePlan", "startRun", "STAGE_DEFS",
+            "applyServerStagePlan", "startRun", "normalizePlannedStages", "STAGE_DEFS",
         )
         script = r"""
 const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
@@ -435,6 +436,7 @@ function element(tag="div"){
  return node;
 }
 globalThis.document={createElement:element};
+ok(api.normalizePlannedStages(["Prepare","Generate","Enhance"]).join(",")==="prepare,denoise,post","display aliases created noncanonical stage IDs");
 const container=element();container.clientWidth=2000;
 const ns={state:api.freshState(),activeRun:{queue_task_id:"A",_stageTimingEpoch:1,_stagePlanEpoch:null,settings:{},step_performance:[]},
  panel:{querySelector:s=>s==="[data-sp-stages]"?container:null},
@@ -502,7 +504,7 @@ ok(unknown.id==="decode"&&unknown.transitionEvidence==="structured-unknown","unk
         source = _source()
         self.assertIn('stage_timing = self._stage_timing.snapshot', source)
         javascript = _javascript_with_exports(
-            "freshState", "applySnapshot", "applyServerStageTiming", "stageElapsedNow", "startRun",
+            "freshState", "applySnapshot", "applyServerStageTiming", "stageElapsedNow", "stageTimeText", "startRun",
         )
         script = r"""
 const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
@@ -520,6 +522,11 @@ api.applyServerStageTiming(ns,timing({
 ok(ns.state.records.input.hasCompleted&&ns.state.records.input.elapsed===2,"missed Inputs not reconstructed");
 ok(ns.state.records.encode.hasCompleted&&ns.state.records.encode.elapsed===7,"polling delay inflated Encode");
 ok(ns.state.currentId==="denoise"&&ns.state.records.denoise.elapsed===15,"active Generate not recovered");
+ok(Object.values(ns.state.records).filter(r=>r.isActive).length===1,"authoritative timing left multiple stages active");
+ok(api.stageTimeText(ns.state,ns.state.records.denoise).includes("15s elapsed"),"Generate card did not use denoise timing");
+api.applySnapshot(ns,{id:"denoise",rawName:"Denoising",rawMessage:"Denoising",progress:12.5,
+ steps:{current:1,total:8,unit:"steps"},stageElapsed:null,overallElapsed:null,transitionEvidence:"structured",aborting:false});
+ok(Number.isFinite(ns.state.records.denoise.eta)&&ns.state.records.denoise.eta>0,"Generate ETA did not use authoritative denoise elapsed");
 mono+=2000;
 ok(Math.abs(api.stageElapsedNow(ns.state.records.denoise)-17)<0.001,"local monotonic interpolation failed");
 api.applyServerStageTiming(ns,timing({denoise:{elapsed:50,active:true,completed:false,run_count:1}},"denoise",2));
@@ -544,7 +551,8 @@ api.applySnapshot(ns,{id:"denoise",rawName:"Aborting",rawMessage:"Aborting",step
 mono+=5000;
 ok(api.stageElapsedNow(ns.state.records.denoise)===12&&ns.state.records.denoise.state==="aborting","abort timing continued");
 api.startRun(ns,{id:"B",settings:{}},{server_time:2});
-ok(Object.values(ns.state.records).every(r=>!r.serverTimed&&!r.hasRun),"task timing leaked");
+ok(ns.state.currentId==="prepare"&&ns.state.records.prepare.isActive&&!ns.state.records.prepare.serverTimed,"new task Prepare missing");
+ok(Object.values(ns.state.records).filter(r=>r.id!=="prepare").every(r=>!r.serverTimed&&!r.hasRun),"task timing leaked");
 const legacy={state:api.freshState(),activeRun:{},source:ns.source};
 const oldNow=Date.now;let wall=1000;Date.now=()=>wall;
 api.applySnapshot(legacy,{id:"encode",rawName:"Encoding prompt",rawMessage:"",steps:{},progress:null,

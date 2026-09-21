@@ -22,15 +22,28 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_worker_outcome_is_task_and_epoch_scoped(self):
+        telemetry = python_helpers("_TaskOutcomeTelemetry")["_TaskOutcomeTelemetry"]()
+        telemetry.begin("A", 4)
+        telemetry.finish("A", 4, True)
+        telemetry.begin("B", 5)
+        telemetry.finish("B", 5, False, aborted=True)
+        records = telemetry.snapshot()
+        self.assertEqual([(item["task_id"], item["execution_epoch"]) for item in records], [("A", 4), ("B", 5)])
+        self.assertTrue(records[0]["known"] and records[0]["success"])
+        self.assertTrue(records[1]["aborted"])
+
     def test_task_stage_planner_uses_media_and_enhancement_configuration(self):
         for token in ('"planned_stages":', '"planned_stage_task_id":', '"planned_stage_execution_epoch":'):
             self.assertIn(token, _source())
         scope = python_helpers(
-            "_configured_task_value", "_task_has_input_media", "_task_has_enhancement", "plan_stages_for_task"
+            "_configured_task_value", "_effective_media_value", "has_effective_media_input",
+            "_task_has_input_media", "_task_has_enhancement", "plan_stages_for_task"
         )
         scope["PLANNED_STAGE_IDS"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
         scope["TASK_INPUT_MEDIA_KEYS"] = {
-            "image_start", "reference_image", "source_video", "control_image", "inputs"
+            "image_start", "image_end", "image_refs", "video_guide", "video_guide2",
+            "audio_guide", "audio_guide2", "video_source"
         }
         plan = scope["plan_stages_for_task"]
         self.assertEqual(
@@ -38,9 +51,20 @@ class V13CompatibilityTests(unittest.TestCase):
             ["prepare", "encode", "denoise", "decode"],
         )
         self.assertEqual(
-            plan({"params": {"model_type": "flux", "reference_image": "reference.png"}}),
+            plan({"params": {"model_type": "flux", "image_refs": ["reference.png"]}}),
             ["prepare", "encode", "input", "denoise", "decode"],
         )
+        empty_upload = {"path": None, "name": None, "url": None, "meta": {"_type": "gradio.FileData"}}
+        for value in (None, "", [], [None], {}, empty_upload, [empty_upload]):
+            self.assertFalse(scope["has_effective_media_input"]({"params": {
+                "image_refs": value, "component_models": {"input": "Video VAE"}
+            }}))
+        for key in ("image_refs", "image_start", "image_end", "video_guide", "video_guide2",
+                    "audio_guide", "audio_guide2", "video_source"):
+            self.assertIn("input", plan({"params": {key: f"{key}.media"}}))
+        combined = plan({"params": {"image_refs": ["ref.png"], "video_guide": "guide.mp4",
+                                     "audio_guide2": {"path": "voice.wav", "meta": {"_type": "FileData"}}}})
+        self.assertEqual(combined.count("input"), 1)
         enhanced = {"params": {"model_type": "flux", "image_start": "start.png", "spatial_upsampling": "ltx252"}}
         self.assertEqual(
             plan(enhanced, {"settings": enhanced["params"]}),
