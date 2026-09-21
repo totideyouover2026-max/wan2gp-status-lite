@@ -322,10 +322,11 @@ assert(run.step_performance.length === 1, "step observation duplicated");
         source = _source()
         for token in ('"status_display":', '"execution_task_known":', '"executing_task": executing_task'):
             self.assertIn(token, source)
-        javascript = _javascript_with_exports("syncRunTelemetry", "readLiveSnapshot", "applySnapshot", "freshState")
+        javascript = _javascript_with_exports("syncRunTelemetry", "readLiveSnapshot", "applySnapshot", "freshState", "applyServerStageTiming", "stageElapsedNow")
         script = r"""
 const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
 globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
+let mono=10000;Object.defineProperty(globalThis,"performance",{value:{now:()=>mono},configurable:true});
 const ns={state:api.freshState(),source:{querySelector:()=>null,querySelectorAll:()=>[]},
 container:{querySelector:()=>null},download:{active:false,visible:false},historyRecording:false,
 runHistory:[],sessionRunIds:new Set(),sessionId:"test",lastExecutingTaskKey:"",
@@ -342,6 +343,24 @@ ok(ns.activeRun===null&&ns.state.records.save.state==="complete","A completion w
 ok(ns.completedStateUntil>Date.now()&&api.readLiveSnapshot(ns)===null,"stale Saved survived transition");
 sync(t(B,"Saved"));ok(ns.activeRun.queue_task_id==="B"&&!ns.progressEpochReady&&api.readLiveSnapshot(ns)===null,"B inherited A progress");
 sync(t(B,"Loading model"));ok(ns.progressEpochReady&&api.readLiveSnapshot(ns).id==="prepare","fresh B progress missing");
+const boundary={state:api.freshState(),source:ns.source,container:ns.container,download:ns.download,
+ historyRecording:false,runHistory:[],sessionRunIds:new Set(),sessionId:"boundary",lastExecutingTaskKey:"",
+ lastExecutionProgressSignature:"",progressEpochReady:true};
+const aTiming={task_id:"A",execution_epoch:7,revision:2,last_stage:"save",stages:{
+ save:{elapsed:4,active:true,completed:false,run_count:1}}};
+boundary.runTelemetry=t(A,"Saving",{stage_timing:aTiming});api.syncRunTelemetry(boundary);
+api.applySnapshot(boundary,api.readLiveSnapshot(boundary));
+const closedSave=boundary.state.records.save;
+ok(closedSave.serverActive&&boundary.state.currentId==="save","Task A Save timing was not active");
+mono+=1000;
+const staleA={...aTiming,revision:3,stages:{save:{elapsed:5,active:true,completed:true,run_count:1}}};
+boundary.runTelemetry=t(B,"Encoding Text Prompt",{server_time:11,stage_timing:staleA});api.syncRunTelemetry(boundary);
+const bSnapshot=api.readLiveSnapshot(boundary);api.applySnapshot(boundary,bSnapshot);
+ok(boundary.activeRun.queue_task_id==="B"&&bSnapshot.id==="encode"&&boundary.state.currentId==="encode","Task B did not display Encode");
+ok(!boundary.state.records.save.hasRun&&!boundary.state.records.save.hasCompleted&&!boundary.state.records.save.isActive,"stale Task-A timing created Save in Task B");
+ok(api.applyServerStageTiming(boundary,{stage_timing:staleA})===false,"stale Task-A timing was accepted");
+const stopped=api.stageElapsedNow(closedSave);mono+=5000;
+ok(api.stageElapsedNow(closedSave)===stopped&&!closedSave.serverActive,"Task A Save kept accumulating past its boundary");
 const legacy={...t(A,"Preparing")};delete legacy.execution_task_known;delete legacy.executing_task;
 legacy.active_task=A;ns.activeRun=null;sync(legacy);ok(ns.activeRun.queue_task_id==="A","legacy fallback regressed");
 """
@@ -476,9 +495,9 @@ const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)}
 let mono=30000;
 Object.defineProperty(globalThis,"performance",{value:{now:()=>mono},configurable:true});
 globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
-const ns={state:api.freshState(),activeRun:{settings:{},step_performance:[]},sessionId:"timing",
+const ns={state:api.freshState(),activeRun:{queue_task_id:"A",_stageTimingEpoch:null,settings:{},step_performance:[]},sessionId:"timing",
  source:{querySelector:()=>null,querySelectorAll:()=>[]}};
-const timing=(stages,last="denoise",revision=1)=>({stage_timing:{task_id:"A",revision,last_stage:last,stages}});
+const timing=(stages,last="denoise",revision=1)=>({stage_timing:{task_id:"A",execution_epoch:1,revision,last_stage:last,stages}});
 api.applyServerStageTiming(ns,timing({
  input:{elapsed:2,active:false,completed:true,run_count:1},
  encode:{elapsed:7,active:false,completed:true,run_count:1},

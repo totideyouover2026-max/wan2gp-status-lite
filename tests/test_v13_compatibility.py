@@ -144,16 +144,36 @@ class V13CompatibilityTests(unittest.TestCase):
         self.assertAlmostEqual(stages["decode"]["elapsed"], 3)
         self.assertAlmostEqual(stages["post"]["elapsed"], 4)
         self.assertAlmostEqual(timer.snapshot("A", now=500)["stages"]["denoise"]["elapsed"], 18)
+        a_epoch = timer.snapshot("A", now=500)["execution_epoch"]
         timer.start_task("B", now=600)
-        fresh = timer.snapshot("B", now=602)["stages"]
+        fresh_snapshot = timer.snapshot("B", now=602)
+        self.assertEqual(fresh_snapshot["task_id"], "B")
+        self.assertGreater(fresh_snapshot["execution_epoch"], a_epoch)
+        fresh = fresh_snapshot["stages"]
         self.assertEqual(set(fresh), {"prepare"})
         self.assertAlmostEqual(fresh["prepare"]["elapsed"], 2)
+        self.assertFalse(timer.observe_phase("A", "Saving output", now=610))
+        after_stale = timer.snapshot("A", now=612)
+        self.assertEqual(after_stale["task_id"], "B")
+        self.assertNotIn("save", after_stale["stages"])
         timer.observe_phase("B", "Denoising", now=603)
         timer.finish_task("B", now=615, completed=False)
         aborted = timer.snapshot("B", now=700)["stages"]["denoise"]
         self.assertAlmostEqual(aborted["elapsed"], 12)
         self.assertFalse(aborted["active"])
         self.assertFalse(aborted["completed"])
+        boundary = scope["_StageTimingTelemetry"]()
+        boundary.start_task("save-task", now=0)
+        boundary.observe_phase("save-task", "Saving output", now=10)
+        save_record = boundary._stages["save"]
+        boundary.start_task("encode-task", now=20)
+        self.assertAlmostEqual(save_record["elapsed"], 10)
+        self.assertFalse(save_record["completed"])
+        self.assertFalse(boundary.observe_phase("save-task", "Saving output", now=80))
+        self.assertAlmostEqual(save_record["elapsed"], 10)
+        next_snapshot = boundary.snapshot("encode-task", now=80)
+        self.assertEqual(next_snapshot["task_id"], "encode-task")
+        self.assertNotIn("save", next_snapshot["stages"])
         sent = []
         def generate(task, send_cmd):
             for phase in ("Encoding Text Prompt", "Denoising", "Saving output"):
