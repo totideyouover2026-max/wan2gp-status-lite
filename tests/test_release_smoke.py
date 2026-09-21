@@ -315,5 +315,217 @@ assert(run.step_performance.length === 1, "step observation duplicated");
             self.assertTrue((ROOT / name).is_file(), name)
 
 
+    def test_v13_execution_boundary_and_completed_stage_retention(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is required for execution-boundary validation")
+        source = _source()
+        for token in ('"status_display":', '"execution_task_known":', '"executing_task": executing_task'):
+            self.assertIn(token, source)
+        javascript = _javascript_with_exports("syncRunTelemetry", "readLiveSnapshot", "applySnapshot", "freshState")
+        script = r"""
+const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
+globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
+const ns={state:api.freshState(),source:{querySelector:()=>null,querySelectorAll:()=>[]},
+container:{querySelector:()=>null},download:{active:false,visible:false},historyRecording:false,
+runHistory:[],sessionRunIds:new Set(),sessionId:"test",lastExecutingTaskKey:"",
+lastExecutionProgressSignature:"",progressEpochReady:true};
+const A={id:"A",settings:{}},B={id:"B",settings:{}};
+const t=(task,phase,extra={})=>({server_time:10,in_progress:true,execution_task_known:true,
+executing_task:task,active_task:task,queue_length:task?1:0,status_display:Boolean(task),status:phase,
+progress_phase:[phase,null],native_progress:{phase,current:null,total:null,unit:null,progress:null},...extra});
+const sync=x=>{ns.runTelemetry=x;api.syncRunTelemetry(ns)};
+sync(t(A,"Saving"));api.applySnapshot(ns,api.readLiveSnapshot(ns));
+ok(ns.activeRun.queue_task_id==="A"&&ns.state.currentId==="save","A did not reach Save");
+sync(t(null,"Saved",{queue_length:1,status_display:true,output_records:[{path:"result.mp4",settings:{}}]}));
+ok(ns.activeRun===null&&ns.state.records.save.state==="complete","A completion was not retained");
+ok(ns.completedStateUntil>Date.now()&&api.readLiveSnapshot(ns)===null,"stale Saved survived transition");
+sync(t(B,"Saved"));ok(ns.activeRun.queue_task_id==="B"&&!ns.progressEpochReady&&api.readLiveSnapshot(ns)===null,"B inherited A progress");
+sync(t(B,"Loading model"));ok(ns.progressEpochReady&&api.readLiveSnapshot(ns).id==="prepare","fresh B progress missing");
+const legacy={...t(A,"Preparing")};delete legacy.execution_task_known;delete legacy.executing_task;
+legacy.active_task=A;ns.activeRun=null;sync(legacy);ok(ns.activeRun.queue_task_id==="A","legacy fallback regressed");
+"""
+        result = subprocess.run([node, "-"], input=javascript + "\n" + script,
+                                text=True, encoding="utf-8", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_repeated_pipeline_passes_preserve_monotonic_stage_completion(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is required for repeated-pass validation")
+        javascript = _javascript_with_exports("freshState", "applySnapshot", "startRun")
+        script = r"""
+const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
+globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
+const make=()=>({state:api.freshState(),activeRun:{settings:{},step_performance:[]},
+ source:{querySelector:()=>null,querySelectorAll:()=>[]},sessionId:"test"});
+const snap=(id,name,evidence="structured",aborting=false)=>({id,rawName:name,rawMessage:name,
+ progress:null,steps:{current:null,total:null,unit:null},stageElapsed:null,overallElapsed:null,
+ transitionEvidence:evidence,aborting});
+const ns=make();
+api.applySnapshot(ns,snap("denoise","Denoising first phase"));
+api.applySnapshot(ns,snap("decode","VAE Decoding"));
+api.applySnapshot(ns,snap("post","Spatial refinement"));
+api.applySnapshot(ns,snap("denoise","Denoising second phase"));
+ok(ns.state.records.denoise.hasCompleted&&ns.state.records.denoise.isActive,"Generate cannot be complete and active");
+ok(ns.state.records.decode.hasCompleted&&ns.state.records.post.hasCompleted,"later Generate erased downstream completion");
+ok(ns.state.records.decode.state==="complete"&&ns.state.records.post.state==="complete","downstream ticks disappeared");
+ok(ns.state.phaseOrder.filter(id=>ns.state.phases[id].stage==="denoise").length===2,"new Generate pass not tracked separately");
+api.applySnapshot(ns,snap("decode","VAE Decoding second pass"));
+api.applySnapshot(ns,snap("save","Saving"));
+ok(ns.state.records.denoise.hasCompleted&&ns.state.records.decode.hasCompleted,"repeated stages lost completion");
+ok(ns.state.records.save.isActive,"final Save not displayed");
+const stale=make();
+for(const s of [snap("encode","Encoding Text Prompt"),snap("denoise","Denoising"),snap("decode","VAE Decoding")]) api.applySnapshot(stale,s);
+const phaseCount=stale.state.phaseOrder.length;
+ok(api.applySnapshot(stale,snap("denoise","Denoising","legacy-dom"))===false,"stale Generate rewind accepted");
+ok(stale.state.currentId==="decode"&&stale.state.phaseOrder.length===phaseCount,"stale Generate mutated phases");
+ok(api.applySnapshot(stale,snap("encode","Encoding Text Prompt","legacy-dom"))===false,"stale Encode rewind accepted");
+const aborting=make();
+for(const s of [snap("denoise","Denoising first phase"),snap("decode","VAE Decoding"),
+ snap("post","Spatial refinement"),snap("denoise","Denoising second phase")]) api.applySnapshot(aborting,s);
+api.applySnapshot(aborting,snap("denoise","Aborting","structured",true));
+ok(aborting.state.records.denoise.hasCompleted&&aborting.state.records.denoise.state==="aborting","repeat-pass abort erased completion");
+ok(aborting.state.records.decode.hasCompleted&&aborting.state.records.post.hasCompleted,"abort erased earlier stages");
+api.startRun(ns,{id:"B",settings:{}},{server_time:2});
+ok(Object.values(ns.state.records).every(r=>!r.hasRun&&!r.hasCompleted&&!r.isActive),"new task inherited stage history");
+"""
+        result = subprocess.run([node, "-"], input=javascript + "\n" + script,
+                                text=True, encoding="utf-8", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+    def test_stable_stage_slots_and_structured_v13_authority(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is required for stage-presentation validation")
+        javascript = _javascript_with_exports(
+            "freshState", "applySnapshot", "renderStages", "readLiveSnapshot", "structuredStageId", "STAGE_DEFS",
+        )
+        script = r"""
+const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
+globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
+function element(tag="div"){
+ const node={tagName:tag,dataset:{},style:{},children:[],attributes:{},className:"",disabled:false,title:"",
+  classList:{values:new Set(),toggle(name,on){if(on)this.values.add(name);else this.values.delete(name)},contains(name){return this.values.has(name)}},
+  append(...items){items.forEach(item=>this.children.push(item))},appendChild(item){this.children.push(item);return item},
+  setAttribute(name,value){this.attributes[name]=String(value)},
+  querySelectorAll(selector){return selector==="[data-stage-id]"?this.children.filter(x=>x.dataset.stageId):[]},
+  querySelector(selector){const cls=selector.replace(/^\./,"");return this.children.find(x=>x.className===cls)||null}};
+ return node;
+}
+globalThis.document={createElement:element};
+const container=element();container.clientWidth=2000;
+const ns={state:api.freshState(),activeRun:{settings:{},step_performance:[]},
+ panel:{querySelector:s=>s==="[data-sp-stages]"?container:null},
+ source:{querySelector:()=>null,querySelectorAll:()=>[]}};
+api.renderStages(ns);
+ok(container.children.length===api.STAGE_DEFS.length,"canonical stage slots were not reserved");
+const ids=container.children.map(x=>x.dataset.stageId),refs=[...container.children];
+ok(ids.join(",")==="prepare,input,encode,denoise,decode,post,save","canonical order changed");
+ok(container.children[2].dataset.stagePosition==="3"&&
+   container.children[2].querySelector(".status-lite__stage-icon").textContent==="3","Encode number was not canonical");
+ok(container.children[1].classList.contains("status-pro__stage--reserved")||
+   container.children[1].classList.contains("status-lite__stage--reserved"),"unseen Inputs slot is prominent");
+const snap=(id,name,evidence="structured")=>({id,rawName:name,rawMessage:name,progress:null,
+ steps:{current:null,total:null,unit:null},stageElapsed:null,overallElapsed:null,transitionEvidence:evidence,aborting:false});
+for(const s of [snap("input","VAE Encoding"),snap("encode","Encoding Text Prompt"),
+ snap("denoise","Denoising"),snap("decode","VAE Decoding"),snap("post","Upsampling")]){
+ api.applySnapshot(ns,s);api.renderStages(ns);
+ ok(container.children.every((node,index)=>node===refs[index]),"existing stage node was reordered");
+ ok(container.children.map(x=>x.dataset.stageId).join(",")===ids.join(","),"optional stage changed order");
+}
+const before=container.children.length;
+api.applySnapshot(ns,snap("denoise","Denoising second phase"));api.renderStages(ns);
+ok(container.children.length===before&&ns.state.records.denoise.runCount===2,"repeated Generate duplicated its card");
+api.applySnapshot(ns,snap("save","Saving"));api.renderStages(ns);
+ok(container.children.every((node,index)=>node===refs[index]),"late Save reordered stage nodes");
+ok(api.structuredStageId("VAE Encoding")==="input","VAE Encode structured mapping");
+ok(api.structuredStageId("Encoding Text Prompt 1/2")==="encode","prompt Encode structured mapping");
+ok(api.structuredStageId("VAE Decoding")==="decode","VAE Decode structured mapping");
+const live={state:api.freshState(),activeRun:{settings:{},step_performance:[]},download:{active:false,visible:false},
+ source:{querySelector:()=>null,querySelectorAll:()=>[]}};
+const phase=(name,status)=>({in_progress:true,execution_task_known:true,executing_task:{id:1},
+ active_task:{id:1},native_progress:{phase:name,current:null,total:null,unit:null,progress:null},
+ progress_phase:[name,null],status});
+live.runTelemetry=phase("VAE Decoding","Generating");
+ok(api.readLiveSnapshot(live).id==="decode","stale Generate text overrode structured Decode");
+live.runTelemetry=phase("Denoising","Encoding prompt");
+ok(api.readLiveSnapshot(live).id==="denoise","stale Encode text overrode structured Generate");
+api.applySnapshot(live,snap("decode","VAE Decoding"));
+live.runTelemetry=phase("Uncatalogued accelerator phase","Encoding prompt");
+const unknown=api.readLiveSnapshot(live);
+ok(unknown.id==="decode"&&unknown.transitionEvidence==="structured-unknown","unknown structured phase rewound");
+"""
+        result = subprocess.run([node, "-"], input=javascript + "\n" + script,
+                                text=True, encoding="utf-8", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+    def test_authoritative_stage_timing_recovery_and_interpolation(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is required for authoritative timing validation")
+        source = _source()
+        self.assertIn('"stage_timing": self._stage_timing.snapshot', source)
+        javascript = _javascript_with_exports(
+            "freshState", "applySnapshot", "applyServerStageTiming", "stageElapsedNow", "startRun",
+        )
+        script = r"""
+const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
+let mono=30000;
+Object.defineProperty(globalThis,"performance",{value:{now:()=>mono},configurable:true});
+globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
+const ns={state:api.freshState(),activeRun:{settings:{},step_performance:[]},sessionId:"timing",
+ source:{querySelector:()=>null,querySelectorAll:()=>[]}};
+const timing=(stages,last="denoise",revision=1)=>({stage_timing:{task_id:"A",revision,last_stage:last,stages}});
+api.applyServerStageTiming(ns,timing({
+ input:{elapsed:2,active:false,completed:true,run_count:1},
+ encode:{elapsed:7,active:false,completed:true,run_count:1},
+ denoise:{elapsed:15,active:true,completed:false,run_count:1}
+}));
+ok(ns.state.records.input.hasCompleted&&ns.state.records.input.elapsed===2,"missed Inputs not reconstructed");
+ok(ns.state.records.encode.hasCompleted&&ns.state.records.encode.elapsed===7,"polling delay inflated Encode");
+ok(ns.state.currentId==="denoise"&&ns.state.records.denoise.elapsed===15,"active Generate not recovered");
+mono+=2000;
+ok(Math.abs(api.stageElapsedNow(ns.state.records.denoise)-17)<0.001,"local monotonic interpolation failed");
+api.applyServerStageTiming(ns,timing({denoise:{elapsed:50,active:true,completed:false,run_count:1}},"denoise",2));
+ok(Math.abs(api.stageElapsedNow(ns.state.records.denoise)-50)<0.001,"fresh server timing did not reconcile");
+mono+=2000;
+ok(Math.abs(api.stageElapsedNow(ns.state.records.denoise)-52)<0.001,"interpolation did not resume");
+api.applyServerStageTiming(ns,timing({denoise:{elapsed:18,active:false,completed:true,run_count:2}},"denoise",3));
+ok(ns.state.records.denoise.elapsed===18&&ns.state.records.denoise.runCount===2,"repeated Generate timing lost");
+const before=ns.state.records.denoise.runCount;
+api.applySnapshot(ns,{id:"decode",rawName:"VAE Decoding",rawMessage:"",steps:{},progress:null,
+ stageElapsed:null,overallElapsed:null,transitionEvidence:"structured",aborting:false});
+const phaseCount=ns.state.phaseOrder.length;
+ok(api.applySnapshot(ns,{id:"denoise",rawName:"Denoising",rawMessage:"",steps:{},progress:null,
+ stageElapsed:null,overallElapsed:null,transitionEvidence:"legacy-dom",aborting:false})===false,"stale rewind accepted");
+ok(ns.state.records.denoise.runCount===before&&ns.state.phaseOrder.length===phaseCount,"stale rewind altered timing");
+api.applyServerStageTiming(ns,timing({save:{elapsed:3,active:false,completed:true,run_count:1}},"save",4));
+mono+=1600;
+ok(api.stageElapsedNow(ns.state.records.save)===3,"completion grace inflated Save");
+api.applyServerStageTiming(ns,timing({denoise:{elapsed:12,active:false,completed:false,run_count:1}},"denoise",5));
+api.applySnapshot(ns,{id:"denoise",rawName:"Aborting",rawMessage:"Aborting",steps:{},progress:null,
+ stageElapsed:null,overallElapsed:null,transitionEvidence:"structured",aborting:true});
+mono+=5000;
+ok(api.stageElapsedNow(ns.state.records.denoise)===12&&ns.state.records.denoise.state==="aborting","abort timing continued");
+api.startRun(ns,{id:"B",settings:{}},{server_time:2});
+ok(Object.values(ns.state.records).every(r=>!r.serverTimed&&!r.hasRun),"task timing leaked");
+const legacy={state:api.freshState(),activeRun:{},source:ns.source};
+const oldNow=Date.now;let wall=1000;Date.now=()=>wall;
+api.applySnapshot(legacy,{id:"encode",rawName:"Encoding prompt",rawMessage:"",steps:{},progress:null,
+ stageElapsed:null,overallElapsed:null,aborting:false});
+wall=11000;
+api.applySnapshot(legacy,{id:"denoise",rawName:"Denoising",rawMessage:"",steps:{},progress:null,
+ stageElapsed:null,overallElapsed:null,aborting:false});
+Date.now=oldNow;
+ok(Math.abs(legacy.state.records.encode.elapsed-10)<0.001,"legacy frontend timing fallback broke");
+"""
+        result = subprocess.run([node, "-"], input=javascript + "\n" + script,
+                                text=True, encoding="utf-8", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

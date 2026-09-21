@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import time
+import threading
 import types
 import unittest
 from functools import wraps
@@ -14,8 +15,8 @@ from test_release_smoke import _source, _javascript_with_exports
 
 def python_helpers(*names):
     tree = ast.parse(_source())
-    definitions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
-    scope = {"time": time, "wraps": wraps}
+    definitions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+    scope = {"time": time, "threading": threading, "wraps": wraps}
     exec(compile(ast.Module(body=definitions, type_ignores=[]), "v13-test", "exec"), scope)
     return scope
 
@@ -115,6 +116,61 @@ class V13CompatibilityTests(unittest.TestCase):
                 owner = types.SimpleNamespace(_insertion_registered=False)
                 scope["post_ui_setup"](owner, {"gen_status": object()})
                 self.assertTrue(owner._insertion_registered)
+
+
+    def test_server_stage_timing_is_monotonic_repeated_and_task_scoped(self):
+        scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_install_generation_timing_observer")
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["STRUCTURED_PHASE_STAGE_RULES"] = (
+            ("input", ("vae encoding",)), ("encode", ("encoding text prompt",)),
+            ("denoise", ("denoising",)), ("decode", ("vae decoding",)),
+            ("post", ("upsampling",)), ("save", ("saving",)), ("prepare", ("preparing",)),
+        )
+        timer = scope["_StageTimingTelemetry"]()
+        self.assertEqual(scope["_structured_stage_id"]("Video 1/1 - Saving output"), "save")
+        timer.start_task("A", now=0)
+        timer.observe_phase("A", "Encoding Text Prompt", now=10)
+        timer.observe_phase("A", "Denoising", now=20)
+        active = timer.snapshot("A", now=25)["stages"]
+        self.assertAlmostEqual(active["encode"]["elapsed"], 10)
+        self.assertAlmostEqual(active["denoise"]["elapsed"], 5)
+        timer.observe_phase("A", "VAE Decoding", now=30)
+        timer.observe_phase("A", "Upsampling", now=33)
+        timer.observe_phase("A", "Denoising Second Phase", now=37)
+        timer.finish_task("A", now=45, completed=True)
+        stages = timer.snapshot("A", now=100)["stages"]
+        self.assertAlmostEqual(stages["denoise"]["elapsed"], 18)
+        self.assertEqual(stages["denoise"]["run_count"], 2)
+        self.assertAlmostEqual(stages["decode"]["elapsed"], 3)
+        self.assertAlmostEqual(stages["post"]["elapsed"], 4)
+        self.assertAlmostEqual(timer.snapshot("A", now=500)["stages"]["denoise"]["elapsed"], 18)
+        timer.start_task("B", now=600)
+        fresh = timer.snapshot("B", now=602)["stages"]
+        self.assertEqual(set(fresh), {"prepare"})
+        self.assertAlmostEqual(fresh["prepare"]["elapsed"], 2)
+        timer.observe_phase("B", "Denoising", now=603)
+        timer.finish_task("B", now=615, completed=False)
+        aborted = timer.snapshot("B", now=700)["stages"]["denoise"]
+        self.assertAlmostEqual(aborted["elapsed"], 12)
+        self.assertFalse(aborted["active"])
+        self.assertFalse(aborted["completed"])
+        sent = []
+        def generate(task, send_cmd):
+            for phase in ("Encoding Text Prompt", "Denoising", "Saving output"):
+                send_cmd("status", phase)
+            return True
+        owner = types.SimpleNamespace(_generation_timing_observer_installed=False,
+                                      _stage_timing=scope["_StageTimingTelemetry"](),
+                                      _active_task_id=None, generate_media=generate)
+        owner.set_global = lambda name, value: setattr(owner, name, value)
+        scope["_install_generation_timing_observer"](owner)
+        owner.generate_media({"id": "worker"}, lambda command, data: sent.append((command, data)))
+        worker = owner._stage_timing.snapshot("worker")["stages"]
+        self.assertTrue({"prepare", "encode", "denoise", "save"}.issubset(worker))
+        self.assertTrue(worker["save"]["completed"])
+        self.assertFalse(worker["save"]["active"])
+        self.assertEqual(len(sent), 3)
+
 
     def test_native_dom_sequences_decode_cancellation_and_qwen(self):
         node = shutil.which("node")

@@ -176,6 +176,149 @@ class _ModelLifecycleTelemetry:
 
 MODEL_LIFECYCLE_TELEMETRY = _ModelLifecycleTelemetry()
 
+STRUCTURED_STAGE_ORDER = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+STRUCTURED_PHASE_STAGE_RULES = (
+    ("save", ("saving", "saved", "save output", "exporting", "writing output", "muxing", "remuxing", "finalizing")),
+    ("input", ("vae encoding", "vae encode", "input preprocessing", "preparing input", "preparing control",
+               "loading control", "extracting pose", "extracting depth", "removing reference background")),
+    ("encode", ("encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
+                "conditioning", "building embeddings", "text features")),
+    ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "reconstructing")),
+    ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial refinement",
+              "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
+              "seedvc", "voice replacement", "audio post processing")),
+    ("denoise", ("denoising", "diffusion", "sampling", "generating audio", "generating waveform",
+                 "generating speech", "spectrum smoothing replay", "yue2 semantic audio", "yue2 acoustic synthesis")),
+    ("prepare", ("preparing", "initializing", "loading model", "downloading model", "compiling", "warming up")),
+)
+
+
+def _structured_stage_id(raw_phase):
+    import re
+    phase = re.sub(r"\s+", " ", re.sub(r"[_-]+", " ", str(raw_phase or "").strip().lower()))
+    phase = re.sub(r"^(?:(?:prompt|sample|sliding window|window|chunk|task|step|phase|pass|video)\s+\d+\s*/\s*\d+\s*,?\s*)+", "", phase).lstrip(" -,:|")
+    if not phase:
+        return None
+    if "yue2 audio decoding" in phase:
+        return "decode"
+    for stage_id, phrases in STRUCTURED_PHASE_STAGE_RULES:
+        if any(phase == item or phase.startswith(item + " ") or phase.startswith(item + ":") or
+               phase.startswith(item + " |") for item in phrases):
+            return stage_id
+    return None
+
+
+class _StageTimingTelemetry:
+    """Task-scoped stage durations measured only in the server monotonic domain."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._task_id = None
+        self._stages = {}
+        self._active_stage = None
+        self._active_since = None
+        self._last_stage = None
+        self._revision = 0
+
+    @staticmethod
+    def _now(now):
+        return time.monotonic() if now is None else float(now)
+
+    def _close_active(self, now, completed=True):
+        if self._active_stage is None or self._active_since is None:
+            return
+        record = self._stages[self._active_stage]
+        record["elapsed"] += max(0.0, now - self._active_since)
+        record["completed"] = bool(record["completed"] or completed)
+        self._active_stage = None
+        self._active_since = None
+        self._revision += 1
+
+    def start_task(self, task_id, now=None):
+        if task_id is None:
+            return
+        now = self._now(now)
+        key = str(task_id)
+        with self._lock:
+            if self._task_id == key:
+                return
+            self._task_id = key
+            self._stages = {}
+            self._active_stage = None
+            self._active_since = None
+            self._last_stage = None
+            self._revision += 1
+            self._observe_stage_locked("prepare", now)
+
+    def _transition_allowed(self, stage_id):
+        if self._active_stage is None or self._active_stage == stage_id:
+            return True
+        current_index = STRUCTURED_STAGE_ORDER.index(self._active_stage)
+        next_index = STRUCTURED_STAGE_ORDER.index(stage_id)
+        if next_index > current_index:
+            return True
+        if stage_id == "denoise" and self._active_stage in ("decode", "post"):
+            return True
+        if stage_id == "decode" and self._active_stage == "post":
+            return True
+        if stage_id == "input" and self._active_stage in ("encode", "post"):
+            return True
+        return False
+
+    def _observe_stage_locked(self, stage_id, now):
+        if stage_id not in STRUCTURED_STAGE_ORDER or not self._transition_allowed(stage_id):
+            return False
+        if self._active_stage == stage_id:
+            return True
+        self._close_active(now)
+        record = self._stages.setdefault(stage_id, {"elapsed": 0.0, "run_count": 0, "completed": False})
+        record["run_count"] += 1
+        self._active_stage = stage_id
+        self._last_stage = stage_id
+        self._active_since = now
+        self._revision += 1
+        return True
+
+    def observe_stage(self, task_id, stage_id, now=None):
+        if task_id is None or stage_id is None:
+            return False
+        now = self._now(now)
+        key = str(task_id)
+        with self._lock:
+            if self._task_id != key:
+                self.start_task(key, now)
+            return self._observe_stage_locked(stage_id, now)
+
+    def observe_phase(self, task_id, raw_phase, now=None):
+        return self.observe_stage(task_id, _structured_stage_id(raw_phase), now)
+
+    def finish_task(self, task_id=None, now=None, completed=False):
+        now = self._now(now)
+        with self._lock:
+            if task_id is not None and self._task_id != str(task_id):
+                return
+            self._close_active(now, completed=completed)
+
+    def snapshot(self, task_id=None, now=None):
+        now = self._now(now)
+        with self._lock:
+            if task_id is not None and self._task_id != str(task_id):
+                return {"task_id": str(task_id), "revision": self._revision, "stages": {}}
+            stages = {}
+            for stage_id, source in self._stages.items():
+                active = stage_id == self._active_stage and self._active_since is not None
+                active_elapsed = max(0.0, now - self._active_since) if active else 0.0
+                stages[stage_id] = {
+                    "elapsed": round(source["elapsed"] + active_elapsed, 4),
+                    "active_elapsed": round(active_elapsed, 4),
+                    "active": active,
+                    "completed": bool(source["completed"]),
+                    "run_count": int(source["run_count"]),
+                }
+            return {"task_id": self._task_id, "revision": self._revision,
+                    "last_stage": self._last_stage, "stages": stages}
+
+
 
 def _telemetry_value(value, depth=0):
     """Return a small JSON-safe representation without copying media payloads."""
@@ -863,6 +1006,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         self._postprocessing_step_observer_installed = False
         self._latest_performance = None
         self._active_task_id = None
+        self._stage_timing = _StageTimingTelemetry()
+        self._generation_timing_observer_installed = False
         self._model_lifecycle_observer_installed = False
 
     def setup_ui(self):
@@ -885,6 +1030,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         self.request_global("get_overridden_attention")
         self.request_global("get_auto_attention")
         self.request_global("build_callback")
+        self.request_global("generate_media")
         self.request_global("perform_spatial_upsampling")
         self.request_global("release_model")
         self.request_global("torch")
@@ -942,6 +1088,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             self._step_observer_installed = True
             return
         torch_module = getattr(self, "torch", None)
+        stage_timing = getattr(self, "_stage_timing", None)
 
         @wraps(original_builder)
         def observed_builder(state, pipe, *args, **kwargs):
@@ -949,7 +1096,10 @@ class StatusLitePlugin(WAN2GPPlugin):
             state = state if isinstance(state, dict) else {}
             gen = state.get("gen") if isinstance(state.get("gen"), dict) else {}
             queue = gen.get("queue") if isinstance(gen.get("queue"), list) else []
-            task_id = queue[0].get("id") if queue and isinstance(queue[0], dict) else None
+            executing = gen.get("api_active_queue_task")
+            task_id = executing.get("id") if isinstance(executing, dict) else (
+                queue[0].get("id") if queue and isinstance(queue[0], dict) else None
+            )
             observer_id = f"{time.time_ns()}"
             performance = _new_performance_observer(task_id)
             performance["id"] = observer_id
@@ -975,7 +1125,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                 normalized_unit = str(progress_unit or "").strip().lower()
                 # Named phases and non-step counters are phase-local, not denoising performance.
                 if progress_title is not None or (normalized_unit and normalized_unit not in ("step", "steps")):
-                    return callback(*callback_args, **callback_kwargs)
+                    result = callback(*callback_args, **callback_kwargs)
+                    if stage_timing is not None:
+                        phase_state = gen.get("progress_phase")
+                        phase_label = phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else ""
+                        stage_timing.observe_phase(task_id, progress_title or phase_label)
+                    return result
                 step_idx = callback_kwargs.get("step_idx", callback_args[0] if callback_args else -1)
                 force_refresh = callback_kwargs.get(
                     "force_refresh",
@@ -998,7 +1153,11 @@ class StatusLitePlugin(WAN2GPPlugin):
                     current_total = override_total
 
                 if step_idx >= 0 and current_total is not None and step_idx >= current_total:
-                    return callback(*callback_args, **callback_kwargs)
+                    result = callback(*callback_args, **callback_kwargs)
+                    phase_state = gen.get("progress_phase")
+                    if stage_timing is not None:
+                        stage_timing.observe_phase(task_id, phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else "")
+                    return result
 
                 now = time.perf_counter()
                 if step_idx >= 0:
@@ -1037,13 +1196,62 @@ class StatusLitePlugin(WAN2GPPlugin):
                     performance["phase_started_at"] = time.time()
                     last_step_at = now
                     last_skip_count = _skip_count(pipe)
-                return callback(*callback_args, **callback_kwargs)
+                result = callback(*callback_args, **callback_kwargs)
+                phase_state = gen.get("progress_phase")
+                if stage_timing is not None:
+                    stage_timing.observe_phase(task_id, phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else "")
+                return result
 
             return observed_callback
 
         observed_builder._status_lite_step_observer = True
         self.set_global("build_callback", observed_builder)
         self._step_observer_installed = True
+
+    def _install_generation_timing_observer(self):
+        if self._generation_timing_observer_installed:
+            return
+        original = getattr(self, "generate_media", None)
+        if not callable(original):
+            return
+        if getattr(original, "_status_lite_generation_timing_observer", False):
+            self._generation_timing_observer_installed = True
+            return
+
+        @wraps(original)
+        def observed(task, *args, **kwargs):
+            task_id = task.get("id") if isinstance(task, dict) else None
+            self._active_task_id = task_id
+            self._stage_timing.start_task(task_id)
+            call_args = list(args)
+            send_cmd = kwargs.get("send_cmd")
+            send_in_args = send_cmd is None and call_args and callable(call_args[0])
+            if send_in_args:
+                send_cmd = call_args[0]
+            if callable(send_cmd):
+                @wraps(send_cmd)
+                def observed_send_cmd(command, data=None, *send_args, **send_kwargs):
+                    phase = data
+                    if command == "progress" and isinstance(data, (list, tuple)) and len(data) > 1:
+                        phase = data[1]
+                    if command in ("status", "progress"):
+                        self._stage_timing.observe_phase(task_id, phase)
+                    return send_cmd(command, data, *send_args, **send_kwargs)
+                if send_in_args:
+                    call_args[0] = observed_send_cmd
+                else:
+                    kwargs["send_cmd"] = observed_send_cmd
+            result = False
+            try:
+                result = original(task, *call_args, **kwargs)
+                return result
+            finally:
+                self._stage_timing.finish_task(task_id, completed=bool(result))
+
+        observed._status_lite_generation_timing_observer = True
+        self.set_global("generate_media", observed)
+        self.generate_media = observed
+        self._generation_timing_observer_installed = True
 
     def _install_postprocessing_step_observer(self):
         if self._postprocessing_step_observer_installed:
@@ -1065,6 +1273,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             progress_callback = kwargs.get("progress_callback")
             lowered = str(spatial_upsampling or "").strip().lower()
             if callable(progress_callback) and lowered.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)):
+                self._stage_timing.observe_stage(self._active_task_id, "post")
                 performance = _new_performance_observer(self._active_task_id)
                 self._latest_performance = performance
                 kwargs["progress_callback"] = _observe_postprocessing_progress(
@@ -1084,10 +1293,11 @@ class StatusLitePlugin(WAN2GPPlugin):
             state = state if isinstance(state, dict) else {}
             gen = state.get("gen") if isinstance(state.get("gen"), dict) else {}
             queue = gen.get("queue") if isinstance(gen.get("queue"), list) else []
-            if gen.get("in_progress") and queue and isinstance(queue[0], dict):
-                self._active_task_id = queue[0].get("id")
-            active_task = _task_telemetry(
-                queue[0],
+            timing_task_id = None
+            execution_task_known = "api_active_queue_task" in gen
+            executing_source = gen.get("api_active_queue_task") if execution_task_known else None
+            executing_task = _task_telemetry(
+                executing_source,
                 get_model_name=getattr(self, "get_model_name", None),
                 get_model_family=getattr(self, "get_model_family", None),
                 families_infos=getattr(self, "families_infos", None),
@@ -1107,7 +1317,41 @@ class StatusLitePlugin(WAN2GPPlugin):
                     transformer_dtype_policy=getattr(self, "transformer_dtype_policy", ""),
                     text_encoder_quantization=getattr(self, "text_encoder_quantization", ""),
                 ),
-            ) if gen.get("in_progress") and queue else None
+            ) if isinstance(executing_source, dict) else None
+            fallback_source = queue[0] if gen.get("in_progress") and queue and isinstance(queue[0], dict) else None
+            active_task = executing_task if execution_task_known else (
+                _task_telemetry(
+                    fallback_source,
+                    get_model_name=getattr(self, "get_model_name", None),
+                    get_model_family=getattr(self, "get_model_family", None),
+                    families_infos=getattr(self, "families_infos", None),
+                    attention_mode=getattr(self, "attention_mode", None),
+                    get_overridden_attention=getattr(self, "get_overridden_attention", None),
+                    get_auto_attention=getattr(self, "get_auto_attention", None),
+                    component_resolver=lambda settings: _model_components(
+                        settings,
+                        get_model_def=getattr(self, "get_model_def", None),
+                        get_base_model_type=getattr(self, "get_base_model_type", None),
+                        get_model_handler=getattr(self, "get_model_handler", None),
+                        get_model_config_groups=getattr(self, "get_model_config_groups", None),
+                        model_config_groups=getattr(self, "model_config_groups", None),
+                        get_model_recursive_prop=getattr(self, "get_model_recursive_prop", None),
+                        get_model_filename=getattr(self, "get_model_filename", None),
+                        transformer_quantization=getattr(self, "transformer_quantization", ""),
+                        transformer_dtype_policy=getattr(self, "transformer_dtype_policy", ""),
+                        text_encoder_quantization=getattr(self, "text_encoder_quantization", ""),
+                    ),
+                ) if fallback_source else None
+            )
+            if active_task:
+                self._active_task_id = active_task.get("id")
+                timing_task_id = self._active_task_id
+                self._stage_timing.start_task(timing_task_id)
+                native_phase = _native_progress_snapshot(gen).get("phase")
+                self._stage_timing.observe_phase(timing_task_id, native_phase)
+                self._stage_timing.observe_phase(timing_task_id, gen.get("status"))
+            elif execution_task_known:
+                self._stage_timing.finish_task(completed=False)
             if active_task and gen.get("sliding_window"):
                 window_prompts = _window_prompts(
                     active_task["settings"].get("prompt"),
@@ -1126,6 +1370,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                 "server_time": time.time(),
                 "runtime_id": self._runtime_id,
                 "in_progress": bool(gen.get("in_progress")),
+                "status_display": bool(gen.get("status_display")) if "status_display" in gen else None,
+                "execution_task_known": execution_task_known,
+                "executing_task": executing_task,
                 "queue_length": len(queue),
                 "queue_task_ids": [_telemetry_value(task.get("id")) for task in queue if isinstance(task, dict)],
                 "active_task": active_task,
@@ -1139,6 +1386,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 "resource_sample": _memory_snapshot(getattr(self, "torch", None)) if gen.get("in_progress") else None,
                 "performance": _latest_performance_snapshot(gen, self._latest_performance),
                 "model_lifecycle": MODEL_LIFECYCLE_TELEMETRY.snapshot(),
+                "stage_timing": self._stage_timing.snapshot(timing_task_id),
             }
             return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except Exception as exc:
@@ -1166,6 +1414,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             print(f"[Status Lite] Download telemetry unavailable: {exc}")
 
         self._install_step_observer()
+        self._install_generation_timing_observer()
         self._install_postprocessing_step_observer()
         self._install_model_lifecycle_observer()
 
@@ -1485,6 +1734,10 @@ class StatusLitePlugin(WAN2GPPlugin):
     min-height: 44px;
 }
 .status-lite__stage:hover { opacity: .92; }
+.status-lite__stage--reserved {
+    visibility: hidden;
+    pointer-events: none;
+}
 .status-lite__stage:focus-visible { outline: 2px solid var(--sp-accent); outline-offset: 2px; }
 .status-lite__stage--complete { opacity: .82; }
 .status-lite__stage--current {
@@ -2156,6 +2409,34 @@ class StatusLitePlugin(WAN2GPPlugin):
         return "prepare";
     }
 
+
+    const STRUCTURED_PHASE_STAGE_RULES = [
+        ["save", ["saving", "saved", "save output", "exporting", "writing output", "muxing", "remuxing", "finalizing"]],
+        ["input", ["vae encoding", "vae encode", "input preprocessing", "preparing input", "preparing control",
+            "loading control", "extracting pose", "extracting depth", "removing reference background"]],
+        ["encode", ["encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
+            "conditioning", "building embeddings", "text features"]],
+        ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "reconstructing"]],
+        ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial refinement",
+            "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
+            "seedvc", "voice replacement", "audio post processing"]],
+        ["denoise", ["denoising", "diffusion", "sampling", "generating audio", "generating waveform",
+            "generating speech", "spectrum smoothing replay", "yue2 semantic audio", "yue2 acoustic synthesis"]],
+        ["prepare", ["preparing", "initializing", "loading model", "downloading model", "compiling", "warming up"]]
+    ];
+
+    function structuredStageId(rawPhase) {
+        let phase = String(rawPhase || "").trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
+        if (!phase) return null;
+        phase = phase.replace(/^(?:(?:prompt|sample|sliding window|window|chunk|task|step|phase|pass|video)\s+\d+\s*\/\s*\d+\s*,?\s*)+/, "").replace(/^[ \-,:|]+/, "");
+        if (phase.includes("yue2 audio decoding")) return "decode";
+        for (const [stageId, phrases] of STRUCTURED_PHASE_STAGE_RULES) {
+            if (phrases.some(phrase => phase === phrase || phase.startsWith(phrase + " ") ||
+                phase.startsWith(phrase + ":") || phase.startsWith(phrase + " |"))) return stageId;
+        }
+        return null;
+    }
+
     function normalizedPhaseLabel(rawName, progress) {
         let label = String(rawName || "Preparing").trim() || "Preparing";
         const current = optionalNumber(progress && progress.current);
@@ -2213,6 +2494,10 @@ class StatusLitePlugin(WAN2GPPlugin):
             label: def.label,
             visible: !def.optional,
             state: "pending",
+            hasRun: false,
+            isActive: false,
+            hasCompleted: false,
+            runCount: 0,
             preloaded: false,
             unreported: false,
             activity: null,
@@ -2360,40 +2645,35 @@ class StatusLitePlugin(WAN2GPPlugin):
         }
     }
 
-    function resetStageForNextDenoisePhase(state, id) {
-        const record = state.records[id];
-        if (!record) return;
-        const definition = STAGE_DEFS.find(def => def.id === id);
-        record.visible = !definition || !definition.optional;
-        record.state = "pending";
-        record.preloaded = false;
-        record.unreported = false;
-        record.activity = null;
-        record.activityModel = "";
-        record.rawName = "";
-        record.rawMessage = "";
-        record.startedAt = null;
-        record.elapsed = null;
-        record.elapsedBase = 0;
-        record.reportedElapsed = null;
-        record.reportedAt = null;
-        record.progress = null;
-        record.progressScope = null;
-        record.eta = null;
-        record.samples = [];
-        record.stepCurrent = null;
-        record.stepTotal = null;
-        record.lastStepCurrent = null;
-        record.lastStepElapsed = null;
-        record.lastStepAt = null;
-        record.stepSamples = [];
-        record.stepSeconds = null;
-        record.recovered = false;
+    function resetDownstreamStagesForNextDenoisePhase(state) {
+        // Downstream stages can run again, but completion is historical and
+        // monotonic for the lifetime of this task. Pass-local fields are reset
+        // when that stage actually becomes active again.
+        if (!state.selectionIsManual) state.selectedId = "denoise";
     }
 
-    function resetDownstreamStagesForNextDenoisePhase(state) {
-        ["decode", "post", "save"].forEach(id => resetStageForNextDenoisePhase(state, id));
-        if (!state.selectionIsManual) state.selectedId = "denoise";
+    function structuredTransitionEvidence(snapshot) {
+        return snapshot && snapshot.transitionEvidence === "structured";
+    }
+
+    function stageTransitionAllowed(state, snapshot) {
+        if (!snapshot || !state.currentId || state.currentId === snapshot.id || snapshot.aborting) return true;
+        if (/^unload/.test(String(snapshot.activity || ""))) return true;
+        const order = STAGE_DEFS.map(stage => stage.id);
+        const currentIndex = order.indexOf(state.currentId);
+        const nextIndex = order.indexOf(snapshot.id);
+        if (currentIndex < 0 || nextIndex < 0 || nextIndex > currentIndex) return true;
+        const phase = phaseInfo(snapshot.rawName, snapshot.steps);
+        const phaseWasSeen = Object.values(state.phases).some(record =>
+            record && (record.phaseKey || record.id) === phase.id
+        );
+        if (snapshot.id === "input" && ["encode", "post"].includes(state.currentId) && !phaseWasSeen) return true;
+        const explicitNextDenoise = phase.kind === "denoise" && Number.isFinite(phase.phaseNumber) &&
+            (!Number.isFinite(state.lastDenoisePhase) || phase.phaseNumber > state.lastDenoisePhase);
+        if (!structuredTransitionEvidence(snapshot) && !explicitNextDenoise) return false;
+        if (snapshot.id === "denoise" && ["decode", "post"].includes(state.currentId)) return true;
+        if (snapshot.id === "decode" && state.currentId === "post") return true;
+        return false;
     }
 
     function applyPhase(state, snapshot, now) {
@@ -2723,6 +3003,7 @@ class StatusLitePlugin(WAN2GPPlugin):
 
     function startRun(namespace, task, telemetry, options = {}) {
         resetJob(namespace);
+        namespace.completedStateUntil = 0;
         const observedNow = Number(telemetry && telemetry.server_time) * 1000 || Date.now();
         const now = Number.isFinite(options.startedAt) ? options.startedAt : observedNow;
         const settings = cloneJson(task && task.settings, {});
@@ -2792,33 +3073,55 @@ class StatusLitePlugin(WAN2GPPlugin):
         const ended = Number.isFinite(completedAt) ? completedAt : Date.now();
         namespace.lastCompletedAt = ended;
         namespace.activeRun = null;
-        resetJob(namespace);
+        namespace.completedStateUntil = Date.now() + IDLE_GRACE_MS;
+    }
+
+    function executionProgressSignature(telemetry) {
+        if (!telemetry) return "";
+        return JSON.stringify({
+            status: telemetry.status || "",
+            progress_phase: telemetry.progress_phase || null,
+            native_progress: telemetry.native_progress || null
+        });
     }
 
     function syncRunTelemetry(namespace) {
         const telemetry = readRunSnapshot(namespace);
         if (!telemetry || telemetry.error || typeof telemetry.in_progress !== "boolean") return;
-        const task = telemetry.active_task && typeof telemetry.active_task === "object"
-            ? telemetry.active_task
-            : null;
+        const authoritative = telemetry.execution_task_known === true;
+        const taskSource = authoritative ? telemetry.executing_task : telemetry.active_task;
+        const task = taskSource && typeof taskSource === "object" ? taskSource : null;
         const nextKey = runTaskKey(task);
         const activeKey = namespace.activeRun && namespace.activeRun.queue_task_id !== null
             ? String(namespace.activeRun.queue_task_id)
             : "";
         const now = Number(telemetry.server_time) * 1000 || Date.now();
+        const progressSignature = executionProgressSignature(telemetry);
+        const previousSignature = namespace.lastExecutionProgressSignature || "";
         if (namespace.activeRun) observePerformanceTelemetry(namespace.activeRun, telemetry);
 
         if (task) {
+            if (namespace.activeRun && namespace.progressEpochReady === false &&
+                progressSignature !== previousSignature) namespace.progressEpochReady = true;
             if (namespace.activeRun && activeKey && activeKey !== nextKey) {
                 finishRun(namespace, "completed", now, telemetry);
             }
-            if (!namespace.activeRun) startRun(namespace, task, telemetry);
+            if (!namespace.activeRun) {
+                const changedTask = Boolean(namespace.lastExecutingTaskKey && namespace.lastExecutingTaskKey !== nextKey);
+                startRun(namespace, task, telemetry);
+                namespace.progressEpochReady = !changedTask || progressSignature !== previousSignature;
+            }
+            namespace.lastExecutingTaskKey = nextKey;
+            namespace.lastExecutionProgressSignature = progressSignature;
             updateActiveRun(namespace, task, telemetry);
+            applyServerStageTiming(namespace, telemetry);
             observeRunOutcome(namespace, telemetry.status, relevantQueueError(telemetry, namespace.activeRun));
             return;
         }
 
-        if (namespace.activeRun && telemetry.in_progress === false) {
+        namespace.lastExecutionProgressSignature = progressSignature;
+        if (namespace.activeRun && (telemetry.in_progress === false || authoritative)) {
+            applyServerStageTiming(namespace, telemetry);
             observeRunOutcome(namespace, telemetry.status, relevantQueueError(telemetry, namespace.activeRun));
             finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
         }
@@ -2942,7 +3245,11 @@ class StatusLitePlugin(WAN2GPPlugin):
         const measurable = current !== null && current >= 0 && total !== null && total > 0;
         const stablePhase = normalizedPhaseLabel(phase, {current, total, unit: native && native.unit});
         const aborting = isStoppingStatus(phase) || isStoppingStatus(telemetry && telemetry.status);
-        const id = aborting ? (namespace.state.currentId || stageIdFor(stablePhase)) : stageIdFor(stablePhase);
+        const authoritativeV13 = Boolean(native && telemetry.execution_task_known === true);
+        const structuredId = authoritativeV13 ? structuredStageId(stablePhase) : null;
+        const id = aborting
+            ? (namespace.state.currentId || structuredId || stageIdFor(stablePhase))
+            : (structuredId || (authoritativeV13 && namespace.state.currentId) || stageIdFor(stablePhase));
         // Raw pre-V13 phase names retain their earlier, pre-generation fallback.
         if (!native && !aborting) {
             if (id !== "input" && id !== "encode") return null;
@@ -2958,6 +3265,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             progress: measurable && !aborting ? clamp(current / total * 100, 0, 100) : null,
             steps: aborting ? namespace.state.steps : {current, total: measurable ? total : null, unit: native && native.unit || null},
             progressScope: measurable ? "phase" : null,
+            transitionEvidence: structuredId ? "structured" : (authoritativeV13 ? "structured-unknown" : "legacy"),
+            structuredPhaseKnown: Boolean(structuredId),
             aborting, textOnly: true
         };
     }
@@ -2987,6 +3296,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             progress: Number.isFinite(progress) && !aborting ? clamp(progress, 0, 100) : null,
             steps: aborting ? namespace.state.steps : steps,
             progressScope: steps.total > 0 && steps.current >= 0 ? "phase" : null,
+            transitionEvidence: "native-dom",
             aborting, textOnly: false
         };
     }
@@ -3018,6 +3328,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             overallElapsed,
             progress: parsePercent(levelText, tracker.querySelector(".progress-bar")),
             steps: parseSteps(metaText),
+            transitionEvidence: "legacy-dom",
             aborting: false,
             textOnly: false
         };
@@ -3170,6 +3481,9 @@ class StatusLitePlugin(WAN2GPPlugin):
 
             record.visible = true;
             record.state = "complete";
+            record.hasRun = true;
+            record.isActive = false;
+            record.hasCompleted = true;
             record.preloaded = false;
             record.unreported = false;
             record.recovered = true;
@@ -3226,15 +3540,96 @@ class StatusLitePlugin(WAN2GPPlugin):
         return recovered;
     }
 
+
+    function browserMonotonicNow() {
+        return globalThis.performance && typeof globalThis.performance.now === "function"
+            ? globalThis.performance.now()
+            : Date.now();
+    }
+
+    function stageElapsedNow(record) {
+        if (!record) return null;
+        if (record.serverTimed && record.serverActive && Number.isFinite(record.serverElapsed) &&
+            Number.isFinite(record.serverReceivedAt)) {
+            return record.serverElapsed + Math.max(0, browserMonotonicNow() - record.serverReceivedAt) / 1000;
+        }
+        return Number.isFinite(record.elapsed) ? record.elapsed : null;
+    }
+
+    function applyServerStageTiming(namespace, telemetry) {
+        const timing = telemetry && telemetry.stage_timing;
+        const stages = timing && timing.stages;
+        if (!stages || typeof stages !== "object" || !namespace || !namespace.state) return false;
+        const state = namespace.state;
+        const receivedAt = browserMonotonicNow();
+        let activeId = null;
+        STAGE_DEFS.forEach(definition => {
+            const source = stages[definition.id];
+            if (!source || typeof source !== "object") return;
+            const elapsed = optionalNumber(source.elapsed);
+            const runCount = optionalNumber(source.run_count);
+            const record = state.records[definition.id];
+            record.visible = true;
+            record.hasRun = true;
+            record.runCount = Number.isFinite(runCount) ? Math.max(0, Math.floor(runCount)) : Math.max(1, record.runCount || 0);
+            record.serverTimed = Number.isFinite(elapsed);
+            record.serverElapsed = Number.isFinite(elapsed) ? Math.max(0, elapsed) : null;
+            record.serverReceivedAt = receivedAt;
+            record.serverActive = source.active === true;
+            record.serverTimingRevision = optionalNumber(timing.revision);
+            if (Number.isFinite(elapsed)) {
+                record.elapsed = Math.max(0, elapsed);
+                record.elapsedBase = record.elapsed;
+                record.reportedElapsed = record.elapsed;
+                record.reportedAt = Date.now();
+            }
+            if (source.completed === true) record.hasCompleted = true;
+            if (source.active === true) {
+                activeId = definition.id;
+                record.isActive = true;
+                record.state = "current";
+                record.startedAt = Date.now();
+            } else {
+                record.isActive = false;
+                if (record.hasCompleted && record.state !== "aborting") {
+                    record.state = "complete";
+                    record.progress = 100;
+                    record.eta = 0;
+                }
+            }
+        });
+        if (activeId) {
+            state.currentId = activeId;
+            if (!state.selectionIsManual || !state.selectedId) state.selectedId = activeId;
+        } else if (timing.last_stage && state.records[timing.last_stage]) {
+            state.currentId = timing.last_stage;
+            const last = state.records[timing.last_stage];
+            if (!last.hasCompleted && last.state !== "aborting") last.state = "current";
+            if (!state.selectionIsManual || !state.selectedId) state.selectedId = timing.last_stage;
+        }
+        return true;
+    }
+
     function finishStage(state, id) {
         if (!id) return;
         const record = state.records[id];
-        if (!record || record.state !== "current") return;
-        if (record.startedAt) {
+        if (!record) return;
+        if (record.state === "aborting") {
+            record.hasRun = true;
+            record.isActive = false;
+            return;
+        }
+        if (record.state !== "current") return;
+        if (record.serverTimed) {
+            record.elapsed = stageElapsedNow(record);
+        } else if (record.startedAt) {
             record.elapsed = (Number.isFinite(record.elapsedBase) ? record.elapsedBase : 0) +
                 (Date.now() - record.startedAt) / 1000;
         }
         record.state = "complete";
+        record.hasRun = true;
+        record.isActive = false;
+        record.hasCompleted = true;
         record.progress = 100;
         record.eta = 0;
         if (id === "denoise" && Number.isFinite(record.stepTotal)) {
@@ -3247,6 +3642,9 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!record || record.state !== "pending") return;
         record.visible = true;
         record.state = "complete";
+        record.hasRun = true;
+        record.isActive = false;
+        record.hasCompleted = true;
         record.preloaded = true;
         record.unreported = false;
         record.rawName = "Model preloaded";
@@ -3264,6 +3662,9 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!record || record.state !== "pending") return;
         record.visible = true;
         record.state = "complete";
+        record.hasRun = true;
+        record.isActive = false;
+        record.hasCompleted = true;
         record.preloaded = false;
         record.unreported = true;
         record.recovered = true;
@@ -3386,6 +3787,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const activeState = namespace.state;
         activeState.inactiveSince = 0;
         activeState.lastSeenAt = now;
+        if (!stageTransitionAllowed(activeState, snapshot)) return false;
         if (namespace.activeRun && activeState.currentId === null &&
             (snapshot.id === "input" || snapshot.id === "encode" || snapshot.id === "denoise")) {
             markPreparePreloaded(activeState);
@@ -3403,6 +3805,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                 ? next.elapsed
                 : 0;
             next.state = snapshot.aborting ? "aborting" : "current";
+            next.hasRun = true;
+            next.isActive = true;
+            next.runCount = (next.runCount || 0) + 1;
             next.preloaded = false;
             next.unreported = false;
             next.activity = null;
@@ -3431,6 +3836,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         const record = activeState.records[snapshot.id];
         record.visible = true;
         record.state = snapshot.aborting ? "aborting" : "current";
+        record.hasRun = true;
+        record.isActive = true;
         record.rawName = snapshot.rawName;
         record.rawMessage = snapshot.rawMessage;
         record.activity = snapshot.activity || null;
@@ -3439,8 +3846,9 @@ class StatusLitePlugin(WAN2GPPlugin):
         // a coherent V13 phase counter as actual decoder progress.
         record.progressScope = snapshot.progressScope || null;
         record.progress = snapshot.id === "decode" && record.progressScope !== "phase" ? null : snapshot.progress;
-        record.elapsed = (Number.isFinite(record.elapsedBase) ? record.elapsedBase : 0) +
-            (now - record.startedAt) / 1000;
+        record.elapsed = record.serverTimed
+            ? stageElapsedNow(record)
+            : (Number.isFinite(record.elapsedBase) ? record.elapsedBase : 0) + (now - record.startedAt) / 1000;
         record.reportedElapsed = Number.isFinite(snapshot.stageElapsed) ? snapshot.stageElapsed : null;
         record.reportedAt = now;
         record.nativeEta = optionalNumber(snapshot.nativeEta);
@@ -3463,14 +3871,15 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function stageTimeText(state, record) {
+        const liveElapsed = stageElapsedNow(record);
         if (record.preloaded) return "Preloaded";
         if (record.unreported) return "Not reported";
-        if (record.state === "complete") return formatDuration(record.elapsed);
-        if (record.state === "aborting") return Number.isFinite(record.elapsed) ? `${formatDuration(record.elapsed)} elapsed` : "Stopping…";
+        if (record.state === "complete") return formatDuration(liveElapsed);
+        if (record.state === "aborting") return Number.isFinite(liveElapsed) ? `${formatDuration(liveElapsed)} elapsed` : "Stopping…";
         if (record.state === "current") {
             const remaining = remainingEstimate(state, record);
             if (Number.isFinite(remaining)) return `${formatDuration(remaining, true)} left`;
-            return Number.isFinite(record.elapsed) ? `${formatDuration(record.elapsed)} elapsed` : "Calculating…";
+            return Number.isFinite(liveElapsed) ? `${formatDuration(liveElapsed)} elapsed` : "Calculating…";
         }
         return "—";
     }
@@ -3869,9 +4278,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         const container = namespace.panel.querySelector("[data-sp-stages]");
         const existing = new Map(Array.from(container.querySelectorAll("[data-stage-id]")).map(button => [button.dataset.stageId, button]));
 
-        const visibleDefs = STAGE_DEFS.filter(def => state.records[def.id].visible);
-        container.dataset.stageCount = String(visibleDefs.length);
-        visibleDefs.forEach((def, visibleIndex) => {
+        container.dataset.stageCount = String(STAGE_DEFS.length);
+        STAGE_DEFS.forEach((def, canonicalIndex) => {
             const record = state.records[def.id];
             let button = existing.get(def.id);
             if (!button) {
@@ -3879,6 +4287,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                 button.type = "button";
                 button.className = "status-lite__stage";
                 button.dataset.stageId = def.id;
+                button.dataset.stagePosition = String(canonicalIndex + 1);
+                button.style.order = String(canonicalIndex);
                 button.setAttribute("role", "tab");
                 const icon = document.createElement("span");
                 icon.className = "status-lite__stage-icon";
@@ -3888,8 +4298,13 @@ class StatusLitePlugin(WAN2GPPlugin):
                 const timing = document.createElement("span");
                 timing.className = "status-lite__stage-time";
                 button.append(icon, name, timing);
+                container.appendChild(button);
             }
+            const relevant = !def.optional || record.visible || record.hasRun || record.isActive || record.hasCompleted;
             const selected = state.selectedId === def.id;
+            button.classList.toggle("status-lite__stage--reserved", !relevant);
+            button.disabled = !relevant;
+            button.setAttribute("aria-hidden", relevant ? "false" : "true");
             button.classList.toggle("status-lite__stage--complete", record.state === "complete");
             const active = record.state === "current" || record.state === "aborting";
             button.classList.toggle("status-lite__stage--current", active);
@@ -3901,21 +4316,16 @@ class StatusLitePlugin(WAN2GPPlugin):
             const accessibleLabel = `${record.rawName || label}: ${statusLabel(record)}, ${stageTimeText(state, record)}${modelSummary}`;
             button.setAttribute("aria-label", accessibleLabel);
             button.title = accessibleLabel;
-            button.querySelector(".status-lite__stage-icon").textContent = record.state === "complete" ? "✓" : (record.state === "aborting" ? "!" : (record.state === "current" ? "●" : String(visibleIndex + 1)));
+            button.querySelector(".status-lite__stage-icon").textContent = record.state === "complete" ? "✓" : (record.state === "aborting" ? "!" : (record.state === "current" ? "●" : String(canonicalIndex + 1)));
             button.querySelector(".status-lite__stage-name").textContent = label;
             button.querySelector(".status-lite__stage-time").textContent = stageTimeText(state, record);
-            const buttonAtIndex = container.children[visibleIndex] || null;
-            if (buttonAtIndex !== button) container.insertBefore(button, buttonAtIndex);
-        });
-        existing.forEach((button, id) => {
-            if (!state.records[id] || !state.records[id].visible) button.remove();
         });
 
         // A fixed breakpoint made four-card runs stack unnecessarily on half-width
         // layouts. Use the actual card count so inline contents are retained whenever
         // every card can keep its intended flex basis without crowding.
-        const inlineWidth = visibleDefs.length
-            ? (visibleDefs.length * 150) + 80 + (Math.max(0, visibleDefs.length - 1) * 7)
+        const inlineWidth = STAGE_DEFS.length
+            ? (STAGE_DEFS.length * 150) + 80 + (Math.max(0, STAGE_DEFS.length - 1) * 7)
             : 0;
         container.classList.toggle("status-lite__stages--inline", container.clientWidth >= inlineWidth);
     }
@@ -4051,14 +4461,26 @@ class StatusLitePlugin(WAN2GPPlugin):
         // Native status text and progress widgets can survive a stopped queue.
         // Only explicit idle telemetry overrides them; keep the DOM fallback
         // when the bridge is unavailable, and preserve independent asset work.
-        if (telemetry && telemetry.in_progress === false && !telemetry.active_task &&
+        const noExecutingTask = telemetry && telemetry.execution_task_known === true
+            ? !telemetry.executing_task
+            : telemetry && telemetry.in_progress === false && !telemetry.active_task;
+        if (noExecutingTask &&
             !downloading) {
             return lifecycle && lifecycle.state === "unloading"
                 ? modelLifecycleSnapshot(namespace)
                 : null;
         }
-        let snapshot = readPrepareStatus(namespace);
-        if (!snapshot && !downloading) snapshot = readReportedPhaseStatus(namespace) || readSnapshot(namespace);
+        if (telemetry && telemetry.execution_task_known === true && telemetry.executing_task &&
+            namespace.progressEpochReady === false && !downloading) {
+            return lifecycle && lifecycle.state === "unloading"
+                ? modelLifecycleSnapshot(namespace)
+                : null;
+        }
+        const reported = !downloading ? readReportedPhaseStatus(namespace) : null;
+        let snapshot = reported && reported.transitionEvidence === "structured"
+            ? reported
+            : readPrepareStatus(namespace);
+        if (!snapshot && !downloading) snapshot = reported || readSnapshot(namespace);
         if (snapshot && isStoppingStatus(snapshot.rawName)) {
             snapshot = {...snapshot, id: namespace.state.currentId || snapshot.id,
                 aborting: true, progress: null, steps: namespace.state.steps};
@@ -4100,11 +4522,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         }
         const now = Date.now();
         if (!namespace.state.inactiveSince) namespace.state.inactiveSince = now;
-        if (!namespace.activeRun && now - namespace.state.inactiveSince >= RESET_AFTER_MS) {
-            finishStage(namespace.state, namespace.state.currentId);
+        if (!namespace.activeRun && namespace.completedStateUntil && now >= namespace.completedStateUntil) {
+            namespace.completedStateUntil = 0;
+            resetJob(namespace);
         }
         setActive(namespace, true);
-        if (namespace.activeRun) render(namespace);
+        if (namespace.activeRun || (namespace.completedStateUntil && now < namespace.completedStateUntil)) render(namespace);
         else renderIdle(namespace);
     }
 
@@ -4198,6 +4621,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                 ? window.crypto.randomUUID()
                 : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`,
             lastCompletedAt: null,
+            completedStateUntil: 0,
+            lastExecutingTaskKey: "",
+            lastExecutionProgressSignature: "",
+            progressEpochReady: true,
             resumeHandler: null,
             collapsed: loadCollapsedPreference(),
             timer: null
