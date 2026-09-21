@@ -419,7 +419,8 @@ ok(Object.values(ns.state.records).every(r=>!r.hasRun&&!r.hasCompleted&&!r.isAct
         if not node:
             self.skipTest("Node is required for stage-presentation validation")
         javascript = _javascript_with_exports(
-            "freshState", "applySnapshot", "renderStages", "readLiveSnapshot", "structuredStageId", "STAGE_DEFS",
+            "freshState", "applySnapshot", "renderStages", "readLiveSnapshot", "structuredStageId",
+            "applyServerStagePlan", "startRun", "STAGE_DEFS",
         )
         script = r"""
 const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
@@ -435,30 +436,43 @@ function element(tag="div"){
 }
 globalThis.document={createElement:element};
 const container=element();container.clientWidth=2000;
-const ns={state:api.freshState(),activeRun:{settings:{},step_performance:[]},
+const ns={state:api.freshState(),activeRun:{queue_task_id:"A",_stageTimingEpoch:1,_stagePlanEpoch:null,settings:{},step_performance:[]},
  panel:{querySelector:s=>s==="[data-sp-stages]"?container:null},
- source:{querySelector:()=>null,querySelectorAll:()=>[]}};
+ source:{querySelector:()=>null,querySelectorAll:()=>[]},sessionId:"plans"};
 api.renderStages(ns);
-ok(container.children.length===api.STAGE_DEFS.length,"canonical stage slots were not reserved");
-const ids=container.children.map(x=>x.dataset.stageId),refs=[...container.children];
-ok(ids.join(",")==="prepare,input,encode,denoise,decode,post,save","canonical order changed");
-ok(container.children[2].dataset.stagePosition==="3"&&
-   container.children[2].querySelector(".status-lite__stage-icon").textContent==="3","Encode number was not canonical");
-ok(container.children[1].classList.contains("status-pro__stage--reserved")||
-   container.children[1].classList.contains("status-lite__stage--reserved"),"unseen Inputs slot is prominent");
+ok(container.children.map(x=>x.dataset.stageId).join(",")==="prepare,encode,denoise,decode","fallback layout has a global gap");
+ok(container.children.map(x=>x.dataset.stagePosition).join(",")==="1,2,3,4","fallback numbering is not contiguous");
+const plan=(id,epoch,stages)=>({planned_stages:stages,planned_stage_task_id:id,
+ planned_stage_execution_epoch:epoch,planned_stage_revision:epoch,
+ stage_timing:{task_id:id,execution_epoch:epoch,revision:1,last_stage:"prepare",stages:{}}});
+ok(api.applyServerStagePlan(ns,plan("A",1,["prepare","encode","denoise","decode"])),"Task A plan rejected");
+api.renderStages(ns);
+let refs=[...container.children];
 const snap=(id,name,evidence="structured")=>({id,rawName:name,rawMessage:name,progress:null,
  steps:{current:null,total:null,unit:null},stageElapsed:null,overallElapsed:null,transitionEvidence:evidence,aborting:false});
-for(const s of [snap("input","VAE Encoding"),snap("encode","Encoding Text Prompt"),
- snap("denoise","Denoising"),snap("decode","VAE Decoding"),snap("post","Upsampling")]){
+for(const s of [snap("encode","Encoding Text Prompt"),snap("denoise","Denoising"),snap("decode","VAE Decoding")]){
  api.applySnapshot(ns,s);api.renderStages(ns);
  ok(container.children.every((node,index)=>node===refs[index]),"existing stage node was reordered");
- ok(container.children.map(x=>x.dataset.stageId).join(",")===ids.join(","),"optional stage changed order");
 }
 const before=container.children.length;
 api.applySnapshot(ns,snap("denoise","Denoising second phase"));api.renderStages(ns);
 ok(container.children.length===before&&ns.state.records.denoise.runCount===2,"repeated Generate duplicated its card");
+api.applySnapshot(ns,snap("post","Unexpected upscaling"));api.renderStages(ns);
+ok(container.children.slice(0,4).every((node,index)=>node===refs[index]),"unexpected Enhance reordered planned nodes");
+ok(container.children[4].dataset.stageId==="post"&&container.children[4].dataset.stagePosition==="5","unexpected Enhance fallback was not deterministic");
+api.startRun(ns,{id:"B",settings:{}},plan("B",2,["prepare","encode","input","denoise","decode","post"]));
+api.renderStages(ns);
+ok(container.children.map(x=>x.dataset.stageId).join(",")==="prepare,encode,input,denoise,decode,post","Task B plan was not rebuilt");
+ok(container.children.map(x=>x.dataset.stagePosition).join(",")==="1,2,3,4,5,6","Task B numbering is not contiguous");
+ok(api.applyServerStagePlan(ns,plan("A",1,["prepare","encode","denoise","decode"]))===false,"stale Task A plan was accepted by Task B");
+refs=[...container.children];
+for(const s of [snap("encode","Encoding Text Prompt"),snap("input","VAE Encoding"),snap("denoise","Denoising")]){
+ ok(api.applySnapshot(ns,s)!==false,"Task B rejected its planned Encode to Inputs order");api.renderStages(ns);
+ ok(container.children.every((node,index)=>node===refs[index]),"Task B planned nodes were recreated during progress");
+}
 api.applySnapshot(ns,snap("save","Saving"));api.renderStages(ns);
-ok(container.children.every((node,index)=>node===refs[index]),"late Save reordered stage nodes");
+ok(container.children.slice(0,6).every((node,index)=>node===refs[index]),"runtime fallback reordered planned nodes");
+ok(container.children[6].dataset.stageId==="save"&&container.children[6].dataset.stagePosition==="7","unexpected Save was not appended deterministically");
 ok(api.structuredStageId("VAE Encoding")==="input","VAE Encode structured mapping");
 ok(api.structuredStageId("Encoding Text Prompt 1/2")==="encode","prompt Encode structured mapping");
 ok(api.structuredStageId("VAE Decoding")==="decode","VAE Decode structured mapping");
@@ -486,7 +500,7 @@ ok(unknown.id==="decode"&&unknown.transitionEvidence==="structured-unknown","unk
         if not node:
             self.skipTest("Node is required for authoritative timing validation")
         source = _source()
-        self.assertIn('"stage_timing": self._stage_timing.snapshot', source)
+        self.assertIn('stage_timing = self._stage_timing.snapshot', source)
         javascript = _javascript_with_exports(
             "freshState", "applySnapshot", "applyServerStageTiming", "stageElapsedNow", "startRun",
         )

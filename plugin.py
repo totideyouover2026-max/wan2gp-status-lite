@@ -889,6 +889,96 @@ def _postprocessing_metadata(settings):
     }
 
 
+PLANNED_STAGE_IDS = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+TASK_INPUT_MEDIA_KEYS = {
+    "image_start", "image_end", "start_image", "end_image", "init_image", "input_image",
+    "input_images", "reference", "references", "reference_image", "reference_images", "image_refs", "ref_images",
+    "image_reference", "reference_paths", "first_frame", "last_frame", "start_frame", "end_frame",
+    "source_image", "source_video", "source_audio", "source_media", "input_video", "input_audio",
+    "video_guide", "image_guide", "audio_guide", "control_image", "control_images", "control_video",
+    "controlnet_image", "controlnet_video", "control_net_image", "control_net_video",
+    "conditioning_image", "conditioning_images", "conditioning_video", "conditioning_media",
+    "mask_image", "pose_image", "depth_image", "media_input", "media_inputs", "inputs",
+}
+
+
+def _configured_task_value(value):
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "none", "off", "disabled", "false", "0", "null"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, dict):
+        return any(_configured_task_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_configured_task_value(item) for item in value)
+    return True
+
+
+def _task_has_input_media(task):
+    if not isinstance(task, dict):
+        return False
+    params = task.get("params") if isinstance(task.get("params"), dict) else {}
+    media_roles = ("input", "source", "reference", "ref", "control", "guide", "start", "end",
+                   "init", "conditioning", "mask", "pose", "depth")
+    media_types = ("image", "images", "video", "audio", "media", "frame", "frames")
+    for values in (task, params):
+        for raw_key, value in values.items():
+            key = str(raw_key or "").strip().lower().replace("-", "_").replace(" ", "_")
+            if not _configured_task_value(value):
+                continue
+            if key in TASK_INPUT_MEDIA_KEYS:
+                return True
+            if any(role in key for role in media_roles) and any(kind in key for kind in media_types):
+                return True
+    return False
+
+
+def _task_has_enhancement(task, settings):
+    settings = settings if isinstance(settings, dict) else {}
+    metadata = settings.get("postprocessing")
+    if isinstance(metadata, dict) and _configured_task_value(metadata.get("operations")):
+        return True
+    params = task.get("params") if isinstance(task, dict) and isinstance(task.get("params"), dict) else {}
+    enhancement_keys = {
+        "temporal_upsampling", "temporal_upsampling_method", "spatial_upsampling", "spatial_upsampling_method",
+        "refinement", "distilled_refinement", "enhance", "enhancement", "upscaler", "upscale_model",
+        "interpolation", "postprocessing",
+    }
+    for values in (settings, params):
+        for raw_key, value in values.items():
+            key = str(raw_key or "").strip().lower().replace("-", "_")
+            if key in enhancement_keys and _configured_task_value(value):
+                return True
+            if key in {"film_grain_intensity", "film_grain"} and _configured_task_value(value):
+                return True
+    return False
+
+
+def plan_stages_for_task(task, telemetry_context=None):
+    """Plan stable top-level presentation stages from the queued job definition."""
+    context = telemetry_context if isinstance(telemetry_context, dict) else {}
+    settings = context.get("settings") if isinstance(context.get("settings"), dict) else {}
+    plan = ["prepare", "encode"]
+    if _task_has_input_media(task):
+        plan.append("input")
+    plan.extend(("denoise", "decode"))
+    enhanced = _task_has_enhancement(task, settings)
+    if enhanced:
+        plan.append("post")
+    params = task.get("params") if isinstance(task, dict) and isinstance(task.get("params"), dict) else {}
+    mode = str(settings.get("mode") or params.get("mode") or "").strip().lower()
+    explicit_save_keys = {"save_output", "export_output", "remux", "remux_output", "mux_output", "finalize_output"}
+    explicit_save = any(
+        str(key).lower() in explicit_save_keys and _configured_task_value(value)
+        for key, value in params.items()
+    )
+    if enhanced or explicit_save or mode in {"edit_remux", "edit_audio"}:
+        plan.append("save")
+    return list(dict.fromkeys(stage for stage in plan if stage in PLANNED_STAGE_IDS))
+
+
 def _task_telemetry(
     task,
     get_model_name=None,
@@ -976,6 +1066,11 @@ def _task_telemetry(
         "client_id": str(params.get("client_id") or "")[:200],
         "repeats": _telemetry_value(task.get("repeats", 1)),
         "settings": settings,
+        "planned_stages": (
+            globals().get("plan_stages_for_task")(task, {"settings": settings})
+            if callable(globals().get("plan_stages_for_task"))
+            else ["prepare", "encode", "denoise", "decode"]
+        ),
     }
 
 
@@ -1376,6 +1471,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                 )
                 if window_prompt:
                     active_task["window_prompt"] = _telemetry_value(window_prompt)
+            stage_timing = self._stage_timing.snapshot(timing_task_id)
+            planned_stages = active_task.get("planned_stages", []) if active_task else []
+            plan_matches_timing = bool(
+                active_task and stage_timing.get("task_id") is not None and
+                str(stage_timing.get("task_id")) == str(active_task.get("id"))
+            )
             payload = {
                 "server_time": time.time(),
                 "runtime_id": self._runtime_id,
@@ -1396,7 +1497,11 @@ class StatusLitePlugin(WAN2GPPlugin):
                 "resource_sample": _memory_snapshot(getattr(self, "torch", None)) if gen.get("in_progress") else None,
                 "performance": _latest_performance_snapshot(gen, self._latest_performance),
                 "model_lifecycle": MODEL_LIFECYCLE_TELEMETRY.snapshot(),
-                "stage_timing": self._stage_timing.snapshot(timing_task_id),
+                "stage_timing": stage_timing,
+                "planned_stages": planned_stages if plan_matches_timing else [],
+                "planned_stage_task_id": stage_timing.get("task_id") if plan_matches_timing else None,
+                "planned_stage_execution_epoch": stage_timing.get("execution_epoch") if plan_matches_timing else None,
+                "planned_stage_revision": stage_timing.get("execution_epoch") if plan_matches_timing else None,
             }
             return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except Exception as exc:
@@ -1574,6 +1679,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         { id: "post", label: "Enhance", optional: true },
         { id: "save", label: "Save", optional: true }
     ];
+    const STAGE_ID_SET = new Set(STAGE_DEFS.map(stage => stage.id));
+    const DEFAULT_PLANNED_STAGES = ["prepare", "encode", "denoise", "decode"];
 
     const STYLE_TEXT = `
 #status-lite-container {
@@ -2502,7 +2609,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         return Object.fromEntries(STAGE_DEFS.map(def => [def.id, {
             id: def.id,
             label: def.label,
-            visible: !def.optional,
+            visible: false,
             state: "pending",
             hasRun: false,
             isActive: false,
@@ -2537,6 +2644,13 @@ class StatusLitePlugin(WAN2GPPlugin):
     function freshState() {
         return {
             records: createStageRecords(),
+            plannedStages: DEFAULT_PLANNED_STAGES.slice(),
+            runtimeDiscoveredStages: [],
+            stagePlanLocked: false,
+            stagePlanTaskId: null,
+            stagePlanEpoch: null,
+            stagePlanRevision: null,
+            stagePlanToken: "fallback",
             phases: {},
             phaseOrder: [],
             currentPhaseId: null,
@@ -2669,10 +2783,14 @@ class StatusLitePlugin(WAN2GPPlugin):
     function stageTransitionAllowed(state, snapshot) {
         if (!snapshot || !state.currentId || state.currentId === snapshot.id || snapshot.aborting) return true;
         if (/^unload/.test(String(snapshot.activity || ""))) return true;
-        const order = STAGE_DEFS.map(stage => stage.id);
+        const planned = state.stagePlanLocked && Array.isArray(state.plannedStages)
+            ? state.plannedStages
+            : STAGE_DEFS.map(stage => stage.id);
+        const order = planned.includes(snapshot.id) ? planned : [...planned, snapshot.id];
         const currentIndex = order.indexOf(state.currentId);
         const nextIndex = order.indexOf(snapshot.id);
         if (currentIndex < 0 || nextIndex < 0 || nextIndex > currentIndex) return true;
+        if (Array.isArray(state.runtimeDiscoveredStages) && state.runtimeDiscoveredStages.includes(state.currentId)) return true;
         const phase = phaseInfo(snapshot.rawName, snapshot.steps);
         const phaseWasSeen = Object.values(state.phases).some(record =>
             record && (record.phaseKey || record.id) === phase.id
@@ -3011,6 +3129,49 @@ class StatusLitePlugin(WAN2GPPlugin):
         return repairedModel;
     }
 
+    function normalizePlannedStages(value) {
+        const stages = Array.isArray(value) ? value : [];
+        return stages
+            .map(stage => String(stage || ""))
+            .filter((stage, index, values) => STAGE_ID_SET.has(stage) && values.indexOf(stage) === index);
+    }
+
+    function applyServerStagePlan(namespace, telemetry) {
+        const activeRun = namespace && namespace.activeRun;
+        const state = namespace && namespace.state;
+        const plan = normalizePlannedStages(telemetry && telemetry.planned_stages);
+        const taskId = telemetry && telemetry.planned_stage_task_id;
+        const epoch = optionalNumber(telemetry && telemetry.planned_stage_execution_epoch);
+        const revision = optionalNumber(telemetry && telemetry.planned_stage_revision);
+        if (!activeRun || !state || !plan.length || taskId === null || taskId === undefined ||
+            String(taskId) !== String(activeRun.queue_task_id) || !Number.isFinite(epoch)) return false;
+        if (Number.isFinite(activeRun._stageTimingEpoch) && activeRun._stageTimingEpoch !== epoch) return false;
+        if (Number.isFinite(activeRun._stagePlanEpoch) && activeRun._stagePlanEpoch !== epoch) return false;
+        if (state.stagePlanLocked) return state.stagePlanTaskId === String(taskId) && state.stagePlanEpoch === epoch;
+        const discovered = STAGE_DEFS.map(stage => stage.id).filter(id => state.records[id] && state.records[id].hasRun);
+        state.plannedStages = [...plan, ...discovered.filter(id => !plan.includes(id))];
+        state.plannedStages.forEach(id => { state.records[id].visible = true; });
+        state.stagePlanLocked = true;
+        state.stagePlanTaskId = String(taskId);
+        state.stagePlanEpoch = epoch;
+        state.stagePlanRevision = revision;
+        state.stagePlanToken = `${taskId}:${epoch}`;
+        activeRun._stagePlanEpoch = epoch;
+        return true;
+    }
+
+    function ensureStageInPlan(state, stageId) {
+        if (!state || !STAGE_ID_SET.has(stageId)) return false;
+        if (!Array.isArray(state.plannedStages)) state.plannedStages = DEFAULT_PLANNED_STAGES.slice();
+        if (!state.plannedStages.includes(stageId)) {
+            state.plannedStages.push(stageId);
+            if (!Array.isArray(state.runtimeDiscoveredStages)) state.runtimeDiscoveredStages = [];
+            if (!state.runtimeDiscoveredStages.includes(stageId)) state.runtimeDiscoveredStages.push(stageId);
+        }
+        state.records[stageId].visible = true;
+        return true;
+    }
+
     function startRun(namespace, task, telemetry, options = {}) {
         resetJob(namespace);
         namespace.completedStateUntil = 0;
@@ -3046,6 +3207,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             step_summary: null,
             _performance_step_keys: {},
             _stageTimingEpoch: initialStageTimingMatches ? initialStageTimingEpoch : null,
+            _stagePlanEpoch: null,
             outputs: [],
             repeats: optionalNumber(task && task.repeats) || 1,
             window_no: window.number,
@@ -3056,6 +3218,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             status_reason: null,
             notice_baseline: visibleFailureNotice(namespace)
         };
+        applyServerStagePlan(namespace, telemetry);
         observePerformanceTelemetry(namespace.activeRun, telemetry);
     }
 
@@ -3130,6 +3293,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             namespace.lastExecutingTaskKey = nextKey;
             namespace.lastExecutionProgressSignature = progressSignature;
             updateActiveRun(namespace, task, telemetry);
+            applyServerStagePlan(namespace, telemetry);
             applyServerStageTiming(namespace, telemetry);
             observeRunOutcome(namespace, telemetry.status, relevantQueueError(telemetry, namespace.activeRun));
             return;
@@ -3589,6 +3753,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         STAGE_DEFS.forEach(definition => {
             const source = stages[definition.id];
             if (!source || typeof source !== "object") return;
+            ensureStageInPlan(state, definition.id);
             const elapsed = optionalNumber(source.elapsed);
             const runCount = optionalNumber(source.run_count);
             const record = state.records[definition.id];
@@ -3813,6 +3978,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         activeState.inactiveSince = 0;
         activeState.lastSeenAt = now;
         if (!stageTransitionAllowed(activeState, snapshot)) return false;
+        ensureStageInPlan(activeState, snapshot.id);
         if (namespace.activeRun && activeState.currentId === null &&
             (snapshot.id === "input" || snapshot.id === "encode" || snapshot.id === "denoise")) {
             markPreparePreloaded(activeState);
@@ -4301,10 +4467,34 @@ class StatusLitePlugin(WAN2GPPlugin):
     function renderStages(namespace) {
         const state = namespace.state;
         const container = namespace.panel.querySelector("[data-sp-stages]");
-        const existing = new Map(Array.from(container.querySelectorAll("[data-stage-id]")).map(button => [button.dataset.stageId, button]));
+        let existing = new Map(Array.from(container.querySelectorAll("[data-stage-id]")).map(button => [button.dataset.stageId, button]));
+        const removeButton = button => {
+            if (typeof button.remove === "function") button.remove();
+            else if (typeof container.removeChild === "function") container.removeChild(button);
+            else if (Array.isArray(container.children)) {
+                const index = container.children.indexOf(button);
+                if (index >= 0) container.children.splice(index, 1);
+            }
+        };
+        const planToken = String(state.stagePlanToken || "fallback");
+        if (container.dataset.stagePlanToken !== planToken) {
+            existing.forEach(removeButton);
+            existing = new Map();
+            container.dataset.stagePlanToken = planToken;
+        }
+        const plannedIds = (Array.isArray(state.plannedStages) ? state.plannedStages : DEFAULT_PLANNED_STAGES)
+            .filter((id, index, values) => STAGE_ID_SET.has(id) && values.indexOf(id) === index);
+        const plannedSet = new Set(plannedIds);
+        existing.forEach((button, id) => {
+            if (!plannedSet.has(id)) {
+                removeButton(button);
+                existing.delete(id);
+            }
+        });
+        const displayStages = plannedIds.map(id => STAGE_DEFS.find(stage => stage.id === id)).filter(Boolean);
 
-        container.dataset.stageCount = String(STAGE_DEFS.length);
-        STAGE_DEFS.forEach((def, canonicalIndex) => {
+        container.dataset.stageCount = String(displayStages.length);
+        displayStages.forEach((def, plannedIndex) => {
             const record = state.records[def.id];
             let button = existing.get(def.id);
             if (!button) {
@@ -4312,8 +4502,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                 button.type = "button";
                 button.className = "status-lite__stage";
                 button.dataset.stageId = def.id;
-                button.dataset.stagePosition = String(canonicalIndex + 1);
-                button.style.order = String(canonicalIndex);
+                button.dataset.stagePosition = String(plannedIndex + 1);
+                button.style.order = String(plannedIndex);
                 button.setAttribute("role", "tab");
                 const icon = document.createElement("span");
                 icon.className = "status-lite__stage-icon";
@@ -4325,11 +4515,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                 button.append(icon, name, timing);
                 container.appendChild(button);
             }
-            const relevant = !def.optional || record.visible || record.hasRun || record.isActive || record.hasCompleted;
             const selected = state.selectedId === def.id;
-            button.classList.toggle("status-lite__stage--reserved", !relevant);
-            button.disabled = !relevant;
-            button.setAttribute("aria-hidden", relevant ? "false" : "true");
+            button.classList.toggle("status-lite__stage--reserved", false);
+            button.disabled = false;
+            button.setAttribute("aria-hidden", "false");
             button.classList.toggle("status-lite__stage--complete", record.state === "complete");
             const active = record.state === "current" || record.state === "aborting";
             button.classList.toggle("status-lite__stage--current", active);
@@ -4341,7 +4530,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             const accessibleLabel = `${record.rawName || label}: ${statusLabel(record)}, ${stageTimeText(state, record)}${modelSummary}`;
             button.setAttribute("aria-label", accessibleLabel);
             button.title = accessibleLabel;
-            button.querySelector(".status-lite__stage-icon").textContent = record.state === "complete" ? "✓" : (record.state === "aborting" ? "!" : (record.state === "current" ? "●" : String(canonicalIndex + 1)));
+            button.querySelector(".status-lite__stage-icon").textContent = record.state === "complete" ? "✓" : (record.state === "aborting" ? "!" : (record.state === "current" ? "●" : String(plannedIndex + 1)));
             button.querySelector(".status-lite__stage-name").textContent = label;
             button.querySelector(".status-lite__stage-time").textContent = stageTimeText(state, record);
         });
@@ -4349,8 +4538,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         // A fixed breakpoint made four-card runs stack unnecessarily on half-width
         // layouts. Use the actual card count so inline contents are retained whenever
         // every card can keep its intended flex basis without crowding.
-        const inlineWidth = STAGE_DEFS.length
-            ? (STAGE_DEFS.length * 150) + 80 + (Math.max(0, STAGE_DEFS.length - 1) * 7)
+        const inlineWidth = displayStages.length
+            ? (displayStages.length * 150) + 80 + (Math.max(0, displayStages.length - 1) * 7)
             : 0;
         container.classList.toggle("status-lite__stages--inline", container.clientWidth >= inlineWidth);
     }

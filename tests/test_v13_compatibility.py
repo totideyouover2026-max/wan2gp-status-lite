@@ -22,6 +22,31 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_task_stage_planner_uses_media_and_enhancement_configuration(self):
+        for token in ('"planned_stages":', '"planned_stage_task_id":', '"planned_stage_execution_epoch":'):
+            self.assertIn(token, _source())
+        scope = python_helpers(
+            "_configured_task_value", "_task_has_input_media", "_task_has_enhancement", "plan_stages_for_task"
+        )
+        scope["PLANNED_STAGE_IDS"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["TASK_INPUT_MEDIA_KEYS"] = {
+            "image_start", "reference_image", "source_video", "control_image", "inputs"
+        }
+        plan = scope["plan_stages_for_task"]
+        self.assertEqual(
+            plan({"params": {"model_type": "flux", "prompt": "a lighthouse"}}),
+            ["prepare", "encode", "denoise", "decode"],
+        )
+        self.assertEqual(
+            plan({"params": {"model_type": "flux", "reference_image": "reference.png"}}),
+            ["prepare", "encode", "input", "denoise", "decode"],
+        )
+        enhanced = {"params": {"model_type": "flux", "image_start": "start.png", "spatial_upsampling": "ltx252"}}
+        self.assertEqual(
+            plan(enhanced, {"settings": enhanced["params"]}),
+            ["prepare", "encode", "input", "denoise", "decode", "post", "save"],
+        )
+
     def test_normalized_progress_copies_valid_counts_and_rejects_stale_units(self):
         normalize = python_helpers("_native_progress_snapshot")["_native_progress_snapshot"]
         for phase, current, total, unit in [
