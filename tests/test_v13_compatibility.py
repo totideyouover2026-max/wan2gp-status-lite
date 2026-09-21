@@ -22,6 +22,25 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_stage_events_require_the_epoch_captured_when_they_were_emitted(self):
+        scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id")
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["STRUCTURED_PHASE_STAGE_RULES"] = (
+            ("encode", ("encoding prompt",)), ("denoise", ("denoising",)),
+            ("save", ("saving",)), ("prepare", ("preparing",)),
+        )
+        timer = scope["_StageTimingTelemetry"]()
+        first_epoch = timer.start_task("same-id", now=0)
+        timer.observe_phase("same-id", "Saving", now=1, execution_epoch=first_epoch)
+        timer.start_task("other", now=2)
+        current_epoch = timer.start_task("same-id", now=3)
+        self.assertGreater(current_epoch, first_epoch)
+        self.assertFalse(timer.observe_phase("same-id", "Saving", now=4, execution_epoch=first_epoch))
+        self.assertTrue(timer.observe_phase("same-id", "Encoding Prompt", now=5, execution_epoch=current_epoch))
+        snapshot = timer.snapshot("same-id", now=6)
+        self.assertNotIn("save", snapshot["stages"])
+        self.assertTrue(snapshot["stages"]["encode"]["active"])
+
     def test_worker_outcome_is_task_and_epoch_scoped(self):
         telemetry = python_helpers("_TaskOutcomeTelemetry")["_TaskOutcomeTelemetry"]()
         telemetry.begin("A", 4)
@@ -171,12 +190,14 @@ class V13CompatibilityTests(unittest.TestCase):
         scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_install_generation_timing_observer")
         scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
         scope["STRUCTURED_PHASE_STAGE_RULES"] = (
-            ("input", ("vae encoding",)), ("encode", ("encoding text prompt",)),
+            ("input", ("vae encoding",)), ("encode", ("encoding prompt", "encoding text prompt")),
             ("denoise", ("denoising",)), ("decode", ("vae decoding",)),
             ("post", ("upsampling",)), ("save", ("saving",)), ("prepare", ("preparing",)),
         )
         timer = scope["_StageTimingTelemetry"]()
         self.assertEqual(scope["_structured_stage_id"]("Video 1/1 - Saving output"), "save")
+        self.assertEqual(scope["_structured_stage_id"]("Encoding Prompt"), "encode")
+        self.assertEqual(scope["_structured_stage_id"]("Video 1/1 - Encoding Prompt"), "encode")
         timer.start_task("A", now=0)
         timer.observe_phase("A", "Encoding Text Prompt", now=10)
         timer.observe_phase("A", "Denoising", now=20)
@@ -239,6 +260,34 @@ class V13CompatibilityTests(unittest.TestCase):
         self.assertTrue(worker["save"]["completed"])
         self.assertFalse(worker["save"]["active"])
         self.assertEqual(len(sent), 3)
+
+        captured = {}
+        def queued_generate(task, send_cmd):
+            captured[str(task["id"])] = send_cmd
+            if task["id"] == "A":
+                send_cmd("status", "Saving output")
+            else:
+                send_cmd("progress", [0, "Video 1/1 - Encoding Prompt"])
+                captured["A"]("status", "Saving output")
+                send_cmd("progress", [0, "Denoising"])
+            return True
+        queue_timer = scope["_StageTimingTelemetry"]()
+        ticks = iter((0, 1, 2, 10, 12, 13, 16, 20))
+        queue_timer._now = lambda now: float(next(ticks)) if now is None else float(now)
+        queue_owner = types.SimpleNamespace(_generation_timing_observer_installed=False,
+                                            _stage_timing=queue_timer,
+                                            _active_task_id=None, generate_media=queued_generate)
+        queue_owner.set_global = lambda name, value: setattr(queue_owner, name, value)
+        scope["_install_generation_timing_observer"](queue_owner)
+        queue_owner.generate_media({"id": "A"}, lambda *_: None)
+        a_epoch = queue_timer.snapshot("A", now=3)["execution_epoch"]
+        queue_owner.generate_media({"id": "B"}, lambda *_: None)
+        b_snapshot = queue_timer.snapshot("B", now=21)
+        self.assertGreater(b_snapshot["execution_epoch"], a_epoch)
+        self.assertTrue(b_snapshot["stages"]["encode"]["completed"])
+        self.assertGreater(b_snapshot["stages"]["encode"]["elapsed"], 0)
+        self.assertTrue(b_snapshot["stages"]["denoise"]["completed"])
+        self.assertNotIn("save", b_snapshot["stages"])
 
 
     def test_native_dom_sequences_decode_cancellation_and_qwen(self):

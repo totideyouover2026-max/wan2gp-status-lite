@@ -327,14 +327,20 @@ assert(run.step_performance.length === 1, "step observation duplicated");
 const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
 globalThis.window={localStorage:{getItem:()=>null,setItem:()=>{}}};
 let mono=10000;Object.defineProperty(globalThis,"performance",{value:{now:()=>mono},configurable:true});
-const ns={state:api.freshState(),source:{querySelector:()=>null,querySelectorAll:()=>[]},
+const staleDom={value:"Saving output"};
+const source={querySelector:s=>s==="textarea, input"?staleDom:null,querySelectorAll:()=>[]};
+const ns={state:api.freshState(),source,
 container:{querySelector:()=>null},download:{active:false,visible:false},historyRecording:false,
 runHistory:[],sessionRunIds:new Set(),sessionId:"test",lastExecutingTaskKey:"",
 lastExecutionProgressSignature:"",progressEpochReady:true};
 const A={id:"A",settings:{}},B={id:"B",settings:{}};
+const ownedTiming=(task,phase)=>{if(!task)return null;const id=String(task.id),epoch=id==="A"?7:8;
+ const stage=id==="B"&&phase==="Saved"?"prepare":(/saving|saved/i.test(phase)?"save":/encoding/i.test(phase)?"encode":/denois/i.test(phase)?"denoise":"prepare");
+ return {task_id:id,execution_epoch:epoch,revision:1,last_stage:stage,stages:{[stage]:{elapsed:stage==="prepare"?0:2,active:true,completed:false,run_count:1}}};};
 const t=(task,phase,extra={})=>({server_time:10,in_progress:true,execution_task_known:true,
 executing_task:task,active_task:task,queue_length:task?1:0,status_display:Boolean(task),status:phase,
-progress_phase:[phase,null],native_progress:{phase,current:null,total:null,unit:null,progress:null},...extra});
+progress_phase:[phase,null],native_progress:{phase,current:null,total:null,unit:null,progress:null},
+stage_timing:ownedTiming(task,phase),...extra});
 const sync=x=>{ns.runTelemetry=x;api.syncRunTelemetry(ns)};
 sync(t(A,"Saving"));api.applySnapshot(ns,api.readLiveSnapshot(ns));
 ok(ns.activeRun.queue_task_id==="A"&&ns.state.currentId==="save","A did not reach Save");
@@ -342,6 +348,7 @@ sync(t(null,"Saved",{queue_length:1,status_display:true,output_records:[{path:"r
 ok(ns.activeRun===null&&ns.state.records.save.state==="complete","A completion was not retained");
 ok(ns.completedStateUntil>Date.now()&&api.readLiveSnapshot(ns)===null,"stale Saved survived transition");
 sync(t(B,"Saved"));ok(ns.activeRun.queue_task_id==="B"&&!ns.progressEpochReady&&api.readLiveSnapshot(ns)===null,"B inherited A progress");
+ok(ns.state.currentId==="prepare"&&ns.state.records.prepare.isActive&&!ns.state.records.save.hasRun,"stale DOM Save replaced B Prepare");
 sync(t(B,"Loading model"));ok(ns.progressEpochReady&&api.readLiveSnapshot(ns).id==="prepare","fresh B progress missing");
 const boundary={state:api.freshState(),source:ns.source,container:ns.container,download:ns.download,
  historyRecording:false,runHistory:[],sessionRunIds:new Set(),sessionId:"boundary",lastExecutingTaskKey:"",
@@ -355,12 +362,32 @@ ok(closedSave.serverActive&&boundary.state.currentId==="save","Task A Save timin
 mono+=1000;
 const staleA={...aTiming,revision:3,stages:{save:{elapsed:5,active:true,completed:true,run_count:1}}};
 boundary.runTelemetry=t(B,"Encoding Text Prompt",{server_time:11,stage_timing:staleA});api.syncRunTelemetry(boundary);
-const bSnapshot=api.readLiveSnapshot(boundary);api.applySnapshot(boundary,bSnapshot);
-ok(boundary.activeRun.queue_task_id==="B"&&bSnapshot.id==="encode"&&boundary.state.currentId==="encode","Task B did not display Encode");
+const staleSnapshot=api.readLiveSnapshot(boundary);
+ok(boundary.activeRun.queue_task_id==="B"&&staleSnapshot===null&&boundary.state.currentId==="prepare","unowned Task-B text overrode fresh Prepare");
 ok(!boundary.state.records.save.hasRun&&!boundary.state.records.save.hasCompleted&&!boundary.state.records.save.isActive,"stale Task-A timing created Save in Task B");
 ok(api.applyServerStageTiming(boundary,{stage_timing:staleA})===false,"stale Task-A timing was accepted");
+const bEncode={task_id:"B",execution_epoch:8,revision:2,last_stage:"encode",stages:{
+ prepare:{elapsed:1,active:false,completed:true,run_count:1},encode:{elapsed:2.5,active:true,completed:false,run_count:1}}};
+boundary.runTelemetry=t(B,"Encoding Prompt",{server_time:12,stage_timing:bEncode});api.syncRunTelemetry(boundary);
+const bSnapshot=api.readLiveSnapshot(boundary);api.applySnapshot(boundary,bSnapshot);
+ok(bSnapshot.id==="encode"&&boundary.state.currentId==="encode"&&boundary.state.records.encode.elapsed>=2.5,"Task B lost its measured Encode");
+const bDenoise={task_id:"B",execution_epoch:8,revision:3,last_stage:"denoise",stages:{
+ prepare:{elapsed:1,active:false,completed:true,run_count:1},encode:{elapsed:3,active:false,completed:true,run_count:1},
+ denoise:{elapsed:5,active:true,completed:false,run_count:1}}};
+boundary.runTelemetry=t(B,"Denoising",{server_time:13,stage_timing:bDenoise});api.syncRunTelemetry(boundary);
+const denoiseSnapshot=api.readLiveSnapshot(boundary);api.applySnapshot(boundary,denoiseSnapshot);
+ok(denoiseSnapshot.id==="denoise"&&boundary.state.currentId==="denoise"&&!boundary.state.records.save.hasRun,"stale DOM Save replaced H3 Generate");
 const stopped=api.stageElapsedNow(closedSave);mono+=5000;
 ok(api.stageElapsedNow(closedSave)===stopped&&!closedSave.serverActive,"Task A Save kept accumulating past its boundary");
+ok(boundary.state.records.denoise.eta===null,"old Save contributed to Task B ETA");
+const direct={state:api.freshState(),source,container:ns.container,download:ns.download,
+ historyRecording:false,runHistory:[],sessionRunIds:new Set(),sessionId:"direct",lastExecutingTaskKey:"",
+ lastExecutionProgressSignature:"",progressEpochReady:true};
+direct.runTelemetry=t(A,"Saving");api.syncRunTelemetry(direct);
+direct.runTelemetry=t(null,"Saved",{in_progress:false,queue_length:0});api.syncRunTelemetry(direct);
+direct.runTelemetry=t(B,"Saved",{queue_length:1});api.syncRunTelemetry(direct);
+ok(direct.state.currentId==="prepare"&&direct.state.records.prepare.isActive&&!direct.state.records.save.hasRun&&api.readLiveSnapshot(direct)===null,
+ "separate H3 run inherited the earlier run's Save DOM");
 const legacy={...t(A,"Preparing")};delete legacy.execution_task_known;delete legacy.executing_task;
 legacy.active_task=A;ns.activeRun=null;sync(legacy);ok(ns.activeRun.queue_task_id==="A","legacy fallback regressed");
 """
@@ -478,19 +505,20 @@ ok(container.children[6].dataset.stageId==="save"&&container.children[6].dataset
 ok(api.structuredStageId("VAE Encoding")==="input","VAE Encode structured mapping");
 ok(api.structuredStageId("Encoding Text Prompt 1/2")==="encode","prompt Encode structured mapping");
 ok(api.structuredStageId("VAE Decoding")==="decode","VAE Decode structured mapping");
-const live={state:api.freshState(),activeRun:{settings:{},step_performance:[]},download:{active:false,visible:false},
+const live={state:api.freshState(),activeRun:{queue_task_id:1,_stageTimingEpoch:1,settings:{},step_performance:[]},download:{active:false,visible:false},
  source:{querySelector:()=>null,querySelectorAll:()=>[]}};
-const phase=(name,status)=>({in_progress:true,execution_task_known:true,executing_task:{id:1},
+const phase=(name,status,stage)=>({in_progress:true,execution_task_known:true,executing_task:{id:1},
  active_task:{id:1},native_progress:{phase:name,current:null,total:null,unit:null,progress:null},
- progress_phase:[name,null],status});
-live.runTelemetry=phase("VAE Decoding","Generating");
+ progress_phase:[name,null],status,stage_timing:{task_id:1,execution_epoch:1,revision:1,last_stage:stage,
+  stages:{[stage]:{elapsed:2,active:true,completed:false,run_count:1}}}});
+live.runTelemetry=phase("VAE Decoding","Generating","decode");
 ok(api.readLiveSnapshot(live).id==="decode","stale Generate text overrode structured Decode");
-live.runTelemetry=phase("Denoising","Encoding prompt");
+live.runTelemetry=phase("Denoising","Encoding prompt","denoise");
 ok(api.readLiveSnapshot(live).id==="denoise","stale Encode text overrode structured Generate");
 api.applySnapshot(live,snap("decode","VAE Decoding"));
-live.runTelemetry=phase("Uncatalogued accelerator phase","Encoding prompt");
+live.runTelemetry=phase("Uncatalogued accelerator phase","Encoding prompt","decode");
 const unknown=api.readLiveSnapshot(live);
-ok(unknown.id==="decode"&&unknown.transitionEvidence==="structured-unknown","unknown structured phase rewound");
+ok(unknown===null&&live.state.currentId==="decode","unowned structured phase rewound authoritative state");
 """
         result = subprocess.run([node, "-"], input=javascript + "\n" + script,
                                 text=True, encoding="utf-8", capture_output=True, check=False)

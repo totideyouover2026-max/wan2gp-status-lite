@@ -181,7 +181,7 @@ STRUCTURED_PHASE_STAGE_RULES = (
     ("save", ("saving", "saved", "save output", "exporting", "writing output", "muxing", "remuxing", "finalizing")),
     ("input", ("vae encoding", "vae encode", "input preprocessing", "preparing input", "preparing control",
                "loading control", "extracting pose", "extracting depth", "removing reference background")),
-    ("encode", ("encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
+    ("encode", ("encoding prompt", "encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
                 "conditioning", "building embeddings", "text features")),
     ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "reconstructing")),
     ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial refinement",
@@ -289,20 +289,26 @@ class _StageTimingTelemetry:
         self._revision += 1
         return True
 
-    def observe_stage(self, task_id, stage_id, now=None):
+    def observe_stage(self, task_id, stage_id, now=None, execution_epoch=None):
         if task_id is None or stage_id is None:
             return False
         now = self._now(now)
         key = str(task_id)
         with self._lock:
+            if execution_epoch is not None and (
+                self._task_id != key or self._execution_epoch != int(execution_epoch)
+            ):
+                return False
             if self._task_id != key:
                 if key in self._retired_task_ids:
                     return False
                 self.start_task(key, now)
             return self._observe_stage_locked(stage_id, now)
 
-    def observe_phase(self, task_id, raw_phase, now=None):
-        return self.observe_stage(task_id, _structured_stage_id(raw_phase), now)
+    def observe_phase(self, task_id, raw_phase, now=None, execution_epoch=None):
+        return self.observe_stage(
+            task_id, _structured_stage_id(raw_phase), now, execution_epoch=execution_epoch
+        )
 
     def finish_task(self, task_id=None, now=None, completed=False):
         now = self._now(now)
@@ -1269,6 +1275,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             task_id = executing.get("id") if isinstance(executing, dict) else (
                 queue[0].get("id") if queue and isinstance(queue[0], dict) else None
             )
+            timing_snapshot = stage_timing.snapshot(task_id) if stage_timing is not None else {}
+            execution_epoch = timing_snapshot.get("execution_epoch")
             observer_id = f"{time.time_ns()}"
             performance = _new_performance_observer(task_id)
             performance["id"] = observer_id
@@ -1298,7 +1306,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                     if stage_timing is not None:
                         phase_state = gen.get("progress_phase")
                         phase_label = phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else ""
-                        stage_timing.observe_phase(task_id, progress_title or phase_label)
+                        stage_timing.observe_phase(
+                            task_id, progress_title or phase_label, execution_epoch=execution_epoch
+                        )
                     return result
                 step_idx = callback_kwargs.get("step_idx", callback_args[0] if callback_args else -1)
                 force_refresh = callback_kwargs.get(
@@ -1325,7 +1335,11 @@ class StatusLitePlugin(WAN2GPPlugin):
                     result = callback(*callback_args, **callback_kwargs)
                     phase_state = gen.get("progress_phase")
                     if stage_timing is not None:
-                        stage_timing.observe_phase(task_id, phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else "")
+                        stage_timing.observe_phase(
+                            task_id,
+                            phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else "",
+                            execution_epoch=execution_epoch,
+                        )
                     return result
 
                 now = time.perf_counter()
@@ -1368,7 +1382,11 @@ class StatusLitePlugin(WAN2GPPlugin):
                 result = callback(*callback_args, **callback_kwargs)
                 phase_state = gen.get("progress_phase")
                 if stage_timing is not None:
-                    stage_timing.observe_phase(task_id, phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else "")
+                    stage_timing.observe_phase(
+                        task_id,
+                        phase_state[0] if isinstance(phase_state, (list, tuple)) and phase_state else "",
+                        execution_epoch=execution_epoch,
+                    )
                 return result
 
             return observed_callback
@@ -1408,7 +1426,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                     if command == "progress" and isinstance(data, (list, tuple)) and len(data) > 1:
                         phase = data[1]
                     if command in ("status", "progress"):
-                        self._stage_timing.observe_phase(task_id, phase)
+                        self._stage_timing.observe_phase(
+                            task_id, phase, execution_epoch=execution_epoch
+                        )
                     return send_cmd(command, data, *send_args, **send_kwargs)
                 if send_in_args:
                     call_args[0] = observed_send_cmd
@@ -1455,7 +1475,11 @@ class StatusLitePlugin(WAN2GPPlugin):
             progress_callback = kwargs.get("progress_callback")
             lowered = str(spatial_upsampling or "").strip().lower()
             if callable(progress_callback) and lowered.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)):
-                self._stage_timing.observe_stage(self._active_task_id, "post")
+                timing_identity = self._stage_timing.snapshot(self._active_task_id)
+                self._stage_timing.observe_stage(
+                    self._active_task_id, "post",
+                    execution_epoch=timing_identity.get("execution_epoch"),
+                )
                 performance = _new_performance_observer(self._active_task_id)
                 self._latest_performance = performance
                 kwargs["progress_callback"] = _observe_postprocessing_progress(
@@ -1528,10 +1552,10 @@ class StatusLitePlugin(WAN2GPPlugin):
             if active_task:
                 self._active_task_id = active_task.get("id")
                 timing_task_id = self._active_task_id
-                self._stage_timing.start_task(timing_task_id)
+                timing_epoch = self._stage_timing.start_task(timing_task_id)
                 native_phase = _native_progress_snapshot(gen).get("phase")
-                self._stage_timing.observe_phase(timing_task_id, native_phase)
-                self._stage_timing.observe_phase(timing_task_id, gen.get("status"))
+                self._stage_timing.observe_phase(timing_task_id, native_phase, execution_epoch=timing_epoch)
+                self._stage_timing.observe_phase(timing_task_id, gen.get("status"), execution_epoch=timing_epoch)
             elif execution_task_known:
                 self._stage_timing.finish_task(completed=False)
             if active_task and gen.get("sliding_window"):
@@ -2609,7 +2633,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         ["save", ["saving", "saved", "save output", "exporting", "writing output", "muxing", "remuxing", "finalizing"]],
         ["input", ["vae encoding", "vae encode", "input preprocessing", "preparing input", "preparing control",
             "loading control", "extracting pose", "extracting depth", "removing reference background"]],
-        ["encode", ["encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
+        ["encode", ["encoding prompt", "encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
             "conditioning", "building embeddings", "text features"]],
         ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "reconstructing"]],
         ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial refinement",
@@ -3560,6 +3584,20 @@ class StatusLitePlugin(WAN2GPPlugin):
             structuredPhaseKnown: Boolean(structuredId),
             aborting, textOnly: true
         };
+    }
+
+    function authoritativeTimingActiveStage(namespace) {
+        const telemetry = namespace && namespace.runTelemetry;
+        const run = namespace && namespace.activeRun;
+        const timing = telemetry && telemetry.stage_timing;
+        const epoch = optionalNumber(timing && timing.execution_epoch);
+        if (!run || !timing || timing.task_id === null || timing.task_id === undefined ||
+            run.queue_task_id === null || run.queue_task_id === undefined ||
+            String(timing.task_id) !== String(run.queue_task_id) || !Number.isFinite(epoch) ||
+            (Number.isFinite(run._stageTimingEpoch) && run._stageTimingEpoch !== epoch)) return null;
+        return STAGE_DEFS.map(stage => stage.id).find(id =>
+            timing.stages && timing.stages[id] && timing.stages[id].active === true
+        ) || null;
     }
 
     function readWangpSnapshot(namespace) {
@@ -4824,6 +4862,20 @@ class StatusLitePlugin(WAN2GPPlugin):
             namespace.progressEpochReady === false && !downloading) {
             return lifecycle && lifecycle.state === "unloading"
                 ? modelLifecycleSnapshot(namespace)
+                : null;
+        }
+        const authoritativeTask = telemetry && telemetry.execution_task_known === true &&
+            telemetry.executing_task && namespace.activeRun &&
+            String(telemetry.executing_task.id) === String(namespace.activeRun.queue_task_id);
+        if (authoritativeTask && !downloading) {
+            const lifecycleSnapshot = lifecycle && lifecycle.state === "unloading"
+                ? modelLifecycleSnapshot(namespace) : null;
+            if (lifecycleSnapshot) return lifecycleSnapshot;
+            if (isStoppingStatus(telemetry.status)) return statusSnapshot(namespace, telemetry.status);
+            const timingStage = authoritativeTimingActiveStage(namespace);
+            const taskOwned = readReportedPhaseStatus(namespace);
+            return taskOwned && taskOwned.transitionEvidence === "structured" && taskOwned.id === timingStage
+                ? taskOwned
                 : null;
         }
         const reported = !downloading ? readReportedPhaseStatus(namespace) : null;
