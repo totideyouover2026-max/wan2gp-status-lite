@@ -22,6 +22,60 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_pre_epoch_global_save_cannot_seed_authoritative_task_timing(self):
+        scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_recover_polled_stage_timing")
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["STRUCTURED_PHASE_STAGE_RULES"] = (
+            ("save", ("saving",)), ("input", ("vae encoding",)),
+            ("encode", ("encoding prompt",)), ("denoise", ("denoising",)),
+            ("prepare", ("preparing",)),
+        )
+        transitions = (
+            ("flux-t2i", "flux-reference", True),
+            ("flux", "h3", True),
+            ("h3", "flux", False),
+            ("flux", "flux-resident", False),
+        )
+        for previous, current, with_input in transitions:
+            with self.subTest(previous=previous, current=current):
+                timer = scope["_StageTimingTelemetry"]()
+                timer.start_task(previous, now=0)
+                timer.observe_phase(previous, "Saving File A", now=1)
+                timer.finish_task(previous, now=2, completed=True)
+                epoch = timer.start_task(current, now=10)
+                self.assertFalse(scope["_recover_polled_stage_timing"](
+                    timer, current, epoch, "Saving File A", "Saving File A", True
+                ))
+                initial = timer.snapshot(current, now=11)
+                self.assertEqual(set(initial["stages"]), {"prepare"})
+                self.assertTrue(initial["stages"]["prepare"]["active"])
+                timer.observe_phase(current, "Encoding Prompt", now=12, execution_epoch=epoch)
+                if with_input:
+                    timer.observe_phase(current, "VAE Encoding", now=15, execution_epoch=epoch)
+                    denoise_at = 18
+                else:
+                    denoise_at = 15
+                timer.observe_phase(current, "Denoising", now=denoise_at, execution_epoch=epoch)
+                before_save = timer.snapshot(current, now=24)
+                self.assertNotIn("save", before_save["stages"])
+                self.assertTrue(before_save["stages"]["encode"]["completed"])
+                self.assertTrue(before_save["stages"]["denoise"]["active"])
+                timer.observe_phase(current, "Saving File B", now=25, execution_epoch=epoch)
+                timer.finish_task(current, now=27, completed=True)
+                final = timer.snapshot(current, now=100)["stages"]
+                self.assertAlmostEqual(final["save"]["elapsed"], 2)
+                self.assertEqual(final["save"]["run_count"], 1)
+                self.assertTrue(final["denoise"]["completed"])
+                if with_input:
+                    self.assertTrue(final["input"]["completed"])
+
+        legacy = scope["_StageTimingTelemetry"]()
+        legacy_epoch = legacy.start_task("legacy", now=0)
+        self.assertTrue(scope["_recover_polled_stage_timing"](
+            legacy, "legacy", legacy_epoch, "Encoding Prompt", "", False
+        ))
+        self.assertTrue(legacy.snapshot("legacy", now=1)["stages"]["encode"]["active"])
+
     def test_stage_events_require_the_epoch_captured_when_they_were_emitted(self):
         scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id")
         scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
