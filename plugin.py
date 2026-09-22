@@ -2906,6 +2906,14 @@ class StatusLitePlugin(WAN2GPPlugin):
         return task && task.id !== null && task.id !== undefined ? String(task.id) : "";
     }
 
+    function taskExecutionKey(task, telemetry) {
+        const taskId = runTaskKey(task);
+        const timing = telemetry && telemetry.stage_timing;
+        const epoch = optionalNumber(timing && timing.execution_epoch);
+        if (!taskId || !timing || String(timing.task_id) !== taskId || !Number.isFinite(epoch)) return "";
+        return `${taskId}:${epoch}`;
+    }
+
     function windowDetails(telemetry) {
         if (!telemetry) return { number: null, total: null };
         let number = optionalNumber(telemetry.window_no);
@@ -3458,6 +3466,11 @@ class StatusLitePlugin(WAN2GPPlugin):
     function finishRun(namespace, status, completedAt, telemetry, outputEnd) {
         const run = namespace.activeRun;
         if (!run) return;
+        const finishedStageId = namespace.state.currentId;
+        const finishedEpoch = optionalNumber(run._stageTimingEpoch);
+        const finishedExecutionKey = Number.isFinite(finishedEpoch) && run.queue_task_id !== null && run.queue_task_id !== undefined
+            ? `${String(run.queue_task_id)}:${finishedEpoch}`
+            : "";
         observePerformanceTelemetry(run, telemetry || namespace.runTelemetry);
         recoverMissedPerformanceStages(namespace);
         finishStage(namespace.state, namespace.state.currentId);
@@ -3465,7 +3478,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         const ended = Number.isFinite(completedAt) ? completedAt : Date.now();
         namespace.lastCompletedAt = ended;
         namespace.activeRun = null;
-        namespace.completedStateUntil = Date.now() + IDLE_GRACE_MS;
+        if (status !== "window" && finishedExecutionKey) namespace.completedExecutionKey = finishedExecutionKey;
+        namespace.completedStateUntil = finishedStageId === "save" ? 0 : Date.now() + IDLE_GRACE_MS;
     }
 
     function executionProgressSignature(telemetry) {
@@ -3484,6 +3498,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const taskSource = authoritative ? telemetry.executing_task : telemetry.active_task;
         const task = taskSource && typeof taskSource === "object" ? taskSource : null;
         const nextKey = runTaskKey(task);
+        const nextExecutionKey = taskExecutionKey(task, telemetry);
         const activeKey = namespace.activeRun && namespace.activeRun.queue_task_id !== null
             ? String(namespace.activeRun.queue_task_id)
             : "";
@@ -3493,6 +3508,18 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (namespace.activeRun) observePerformanceTelemetry(namespace.activeRun, telemetry);
 
         if (task) {
+            const terminalOutcome = namespace.activeRun && taskOutcomeForRun(namespace.activeRun, telemetry);
+            if (terminalOutcome && terminalOutcome.known === true) {
+                finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
+                namespace.lastExecutingTaskKey = nextKey;
+                namespace.lastExecutionProgressSignature = progressSignature;
+                return;
+            }
+            if (authoritative && !namespace.activeRun && nextExecutionKey && namespace.completedExecutionKey === nextExecutionKey) {
+                namespace.lastExecutingTaskKey = nextKey;
+                namespace.lastExecutionProgressSignature = progressSignature;
+                return;
+            }
             if (namespace.activeRun && namespace.progressEpochReady === false &&
                 progressSignature !== previousSignature) namespace.progressEpochReady = true;
             if (namespace.activeRun && activeKey && activeKey !== nextKey) {
@@ -5163,6 +5190,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`,
             lastCompletedAt: null,
             completedStateUntil: 0,
+            completedExecutionKey: "",
             lastExecutingTaskKey: "",
             lastExecutionProgressSignature: "",
             progressEpochReady: true,

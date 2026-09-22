@@ -349,9 +349,11 @@ stage_timing:ownedTiming(task,phase),...extra});
 const sync=x=>{ns.runTelemetry=x;api.syncRunTelemetry(ns)};
 sync(t(A,"Saving"));api.applySnapshot(ns,api.readLiveSnapshot(ns));
 ok(ns.activeRun.queue_task_id==="A"&&ns.state.currentId==="save","A did not reach Save");
-sync(t(null,"Saved",{queue_length:1,status_display:true,output_records:[{path:"result.mp4",settings:{}}]}));
+sync(t(A,"Saved",{queue_length:1,status_display:true,output_records:[{path:"result.mp4",settings:{}}],
+ task_outcomes:[{task_id:"A",execution_epoch:7,known:true,success:true,aborted:false,output_records:[{path:"result.mp4",settings:{}}]}]}));
 ok(ns.activeRun===null&&ns.state.records.save.state==="complete","A completion was not retained");
-ok(ns.completedStateUntil>Date.now()&&api.readLiveSnapshot(ns)===null,"stale Saved survived transition");
+ok(ns.completedStateUntil===0&&ns.completedExecutionKey==="A:7"&&api.readLiveSnapshot(ns)===null,
+ "terminal Save remained present or was not bound to its completed execution");
 sync(t(B,"Saved"));ok(ns.activeRun.queue_task_id==="B"&&!ns.progressEpochReady&&api.readLiveSnapshot(ns)===null,"B inherited A progress");
 ok(ns.state.currentId==="prepare"&&ns.state.records.prepare.isActive&&!ns.state.records.save.hasRun,"stale DOM Save replaced B Prepare");
 sync(t(B,"Loading model"));ok(ns.progressEpochReady&&api.readLiveSnapshot(ns).id==="prepare","fresh B progress missing");
@@ -448,7 +450,7 @@ check(ns.idleOperation === null && switching && switching.activity === "unload",
                                 text=True, encoding="utf-8", capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_completed_save_holds_before_automatic_idle_unload(self):
+    def test_completed_save_yields_immediately_to_automatic_idle_unload(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("Node is required for finish presentation validation")
@@ -465,27 +467,20 @@ state.currentId = "save";
 state.records.save.state = "complete";
 state.records.save.hasRun = true;
 state.records.save.hasCompleted = true;
-const ns = {state, activeRun: null, idleOperation: null, completedStateUntil: 2600,
+const ns = {state, activeRun: null, idleOperation: null, completedStateUntil: 0,
   runTelemetry: {execution_task_known: true, executing_task: null, in_progress: false,
     model_lifecycle: {token: "final", state: "unloading", model_name: "Flux"}}};
 api.syncIdleModelLifecycle(ns);
-check(ns.idleOperation && ns.idleOperation.pendingCompletion, "overlapping unload was not latched");
-check(api.presentationMode(ns, now) === "completion", "automatic unload hid completed Save immediately");
+check(ns.idleOperation && !ns.idleOperation.pendingCompletion, "automatic unload was not presented after Save ended");
+check(api.presentationMode(ns, now) === "idle-operation", "completed Save remained visible after its process ended");
 now = 1500;
 ns.runTelemetry.model_lifecycle = {token: "final", state: "unloaded", model_name: "Flux"};
 api.syncIdleModelLifecycle(ns);
-check(api.presentationMode(ns, now) === "completion", "terminal unload interrupted the Save hold");
+check(api.presentationMode(ns, now) === "idle-operation", "terminal unload reopened completed Save");
 now = 2600;
 ns.runTelemetry.model_lifecycle = null;
 api.syncIdleModelLifecycle(ns);
-check(api.presentationMode(ns, now) === "idle-operation", "latched unload was lost after completion hold");
-check(ns.idleOperation.state === "unloaded", "latched unload did not settle terminally");
-now = 3000;
-api.syncIdleModelLifecycle(ns);
-check(api.presentationMode(ns, now) === "idle-operation", "unload presentation cleared too early");
-now = 3401;
-api.syncIdleModelLifecycle(ns);
-check(api.presentationMode(ns, now) === "idle", "unload did not transition once to clean idle");
+check(api.presentationMode(ns, now) === "idle", "settled unload did not transition once to clean idle");
 check(state.records.save.hasCompleted && state.records.save.state === "complete", "presentation arbitration mutated Save timing");
 '''
         result = subprocess.run([node, "-"], input=javascript + "\n" + test_script,
