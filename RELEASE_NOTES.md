@@ -1,4 +1,10 @@
-# Status Lite 1.1.1
+# Status Lite 1.1.2
+
+Status Lite 1.1.2 stabilises task-owned live stage timing across queued and separate generations. Task identity and execution epoch are bound before progress callbacks, so fast Encode activity is retained and timing from a previous task cannot create or extend stages in the next task.
+
+Authoritative WanGP V13 state now takes precedence over stale native DOM status. Save is shown while saving, then yields cleanly to the completed presentation without flashing between the two views.
+
+## Status Lite 1.1.1
 
 Status Lite 1.1.1 is a focused download compatibility hotfix. WanGP V13 model, module, and LoRA downloads now pass every native argument through the Status observer unchanged, including progress generators and filename display settings. Older WanGP download calls remain supported.
 
