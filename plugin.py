@@ -5029,6 +5029,13 @@ class StatusLitePlugin(WAN2GPPlugin):
             !downloading) {
             return null;
         }
+        // Once an authoritative task has been closed locally, its worker entry
+        // may linger for a poll while the native DOM still says Saved. Without
+        // an owned active run, that DOM has no right to reopen the stage view.
+        const unownedExecutingTask = telemetry && telemetry.execution_task_known === true &&
+            telemetry.executing_task && (!namespace.activeRun ||
+                String(telemetry.executing_task.id) !== String(namespace.activeRun.queue_task_id));
+        if (unownedExecutingTask && !downloading) return null;
         if (telemetry && telemetry.execution_task_known === true && telemetry.executing_task &&
             namespace.progressEpochReady === false && !downloading) {
             return lifecycle && lifecycle.state === "unloading"

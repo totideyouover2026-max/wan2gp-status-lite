@@ -355,10 +355,12 @@ ok(ns.activeRun===null&&ns.state.records.save.state==="complete","A completion w
 ok(ns.completedStateUntil===0&&ns.completedTaskKey==="A"&&ns.completedExecutionKey==="A:7"&&api.readLiveSnapshot(ns)===null,
  "terminal Save remained present or was not bound to its completed execution");
 sync(t(A,"Saved",{stage_timing:null,task_outcomes:[]}));
-ok(ns.activeRun===null&&ns.completedTaskKey==="A","timing-free lingering task reopened completed Save");
+ok(ns.activeRun===null&&ns.completedTaskKey==="A"&&api.readLiveSnapshot(ns)===null,
+ "timing-free lingering task or stale DOM reopened completed Save");
 sync(t(null,"Complete",{in_progress:false,stage_timing:null,task_outcomes:[]}));
 sync(t(A,"Saved",{stage_timing:null,task_outcomes:[]}));
-ok(ns.activeRun===null,"completed task reopened after an intermittent empty worker snapshot");
+ok(ns.activeRun===null&&api.readLiveSnapshot(ns)===null,
+ "completed task or stale DOM reopened after an intermittent empty worker snapshot");
 sync(t(B,"Saved"));ok(ns.activeRun.queue_task_id==="B"&&!ns.progressEpochReady&&api.readLiveSnapshot(ns)===null,"B inherited A progress");
 ok(ns.state.currentId==="prepare"&&ns.state.records.prepare.isActive&&!ns.state.records.save.hasRun,"stale DOM Save replaced B Prepare");
 sync(t(B,"Loading model"));ok(ns.progressEpochReady&&api.readLiveSnapshot(ns).id==="prepare","fresh B progress missing");
