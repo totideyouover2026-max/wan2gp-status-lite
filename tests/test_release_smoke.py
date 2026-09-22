@@ -448,6 +448,50 @@ check(ns.idleOperation === null && switching && switching.activity === "unload",
                                 text=True, encoding="utf-8", capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_completed_save_holds_before_automatic_idle_unload(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is required for finish presentation validation")
+        javascript = _javascript_with_exports(
+            "freshState", "syncIdleModelLifecycle", "presentationMode"
+        )
+        test_script = r'''
+const api = globalThis.__statusProReleaseTest;
+const check = (condition, message) => {if (!condition) throw new Error(message);};
+let now = 1000;
+Date.now = () => now;
+const state = api.freshState();
+state.currentId = "save";
+state.records.save.state = "complete";
+state.records.save.hasRun = true;
+state.records.save.hasCompleted = true;
+const ns = {state, activeRun: null, idleOperation: null, completedStateUntil: 2600,
+  runTelemetry: {execution_task_known: true, executing_task: null, in_progress: false,
+    model_lifecycle: {token: "final", state: "unloading", model_name: "Flux"}}};
+api.syncIdleModelLifecycle(ns);
+check(ns.idleOperation && ns.idleOperation.pendingCompletion, "overlapping unload was not latched");
+check(api.presentationMode(ns, now) === "completion", "automatic unload hid completed Save immediately");
+now = 1500;
+ns.runTelemetry.model_lifecycle = {token: "final", state: "unloaded", model_name: "Flux"};
+api.syncIdleModelLifecycle(ns);
+check(api.presentationMode(ns, now) === "completion", "terminal unload interrupted the Save hold");
+now = 2600;
+ns.runTelemetry.model_lifecycle = null;
+api.syncIdleModelLifecycle(ns);
+check(api.presentationMode(ns, now) === "idle-operation", "latched unload was lost after completion hold");
+check(ns.idleOperation.state === "unloaded", "latched unload did not settle terminally");
+now = 3000;
+api.syncIdleModelLifecycle(ns);
+check(api.presentationMode(ns, now) === "idle-operation", "unload presentation cleared too early");
+now = 3401;
+api.syncIdleModelLifecycle(ns);
+check(api.presentationMode(ns, now) === "idle", "unload did not transition once to clean idle");
+check(state.records.save.hasCompleted && state.records.save.state === "complete", "presentation arbitration mutated Save timing");
+'''
+        result = subprocess.run([node, "-"], input=javascript + "\n" + test_script,
+                                text=True, encoding="utf-8", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_repeated_pipeline_passes_preserve_monotonic_stage_completion(self):
         node = shutil.which("node")
         if not node:
