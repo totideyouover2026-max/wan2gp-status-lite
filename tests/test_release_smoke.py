@@ -352,8 +352,13 @@ ok(ns.activeRun.queue_task_id==="A"&&ns.state.currentId==="save","A did not reac
 sync(t(A,"Saved",{queue_length:1,status_display:true,output_records:[{path:"result.mp4",settings:{}}],
  task_outcomes:[{task_id:"A",execution_epoch:7,known:true,success:true,aborted:false,output_records:[{path:"result.mp4",settings:{}}]}]}));
 ok(ns.activeRun===null&&ns.state.records.save.state==="complete","A completion was not retained");
-ok(ns.completedStateUntil===0&&ns.completedExecutionKey==="A:7"&&api.readLiveSnapshot(ns)===null,
+ok(ns.completedStateUntil===0&&ns.completedTaskKey==="A"&&ns.completedExecutionKey==="A:7"&&api.readLiveSnapshot(ns)===null,
  "terminal Save remained present or was not bound to its completed execution");
+sync(t(A,"Saved",{stage_timing:null,task_outcomes:[]}));
+ok(ns.activeRun===null&&ns.completedTaskKey==="A","timing-free lingering task reopened completed Save");
+sync(t(null,"Complete",{in_progress:false,stage_timing:null,task_outcomes:[]}));
+sync(t(A,"Saved",{stage_timing:null,task_outcomes:[]}));
+ok(ns.activeRun===null,"completed task reopened after an intermittent empty worker snapshot");
 sync(t(B,"Saved"));ok(ns.activeRun.queue_task_id==="B"&&!ns.progressEpochReady&&api.readLiveSnapshot(ns)===null,"B inherited A progress");
 ok(ns.state.currentId==="prepare"&&ns.state.records.prepare.isActive&&!ns.state.records.save.hasRun,"stale DOM Save replaced B Prepare");
 sync(t(B,"Loading model"));ok(ns.progressEpochReady&&api.readLiveSnapshot(ns).id==="prepare","fresh B progress missing");

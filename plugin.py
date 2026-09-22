@@ -3478,7 +3478,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         const ended = Number.isFinite(completedAt) ? completedAt : Date.now();
         namespace.lastCompletedAt = ended;
         namespace.activeRun = null;
-        if (status !== "window" && finishedExecutionKey) namespace.completedExecutionKey = finishedExecutionKey;
+        if (status !== "window") {
+            namespace.completedTaskKey = run.queue_task_id !== null && run.queue_task_id !== undefined
+                ? String(run.queue_task_id)
+                : "";
+            if (finishedExecutionKey) namespace.completedExecutionKey = finishedExecutionKey;
+        }
         namespace.completedStateUntil = finishedStageId === "save" ? 0 : Date.now() + IDLE_GRACE_MS;
     }
 
@@ -3515,7 +3520,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                 namespace.lastExecutionProgressSignature = progressSignature;
                 return;
             }
-            if (authoritative && !namespace.activeRun && nextExecutionKey && namespace.completedExecutionKey === nextExecutionKey) {
+            const lingeringCompletedTask = authoritative && !namespace.activeRun &&
+                namespace.completedTaskKey === nextKey &&
+                (!nextExecutionKey || namespace.completedExecutionKey === nextExecutionKey);
+            if (lingeringCompletedTask) {
                 namespace.lastExecutingTaskKey = nextKey;
                 namespace.lastExecutionProgressSignature = progressSignature;
                 return;
@@ -5190,6 +5198,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`,
             lastCompletedAt: null,
             completedStateUntil: 0,
+            completedTaskKey: "",
             completedExecutionKey: "",
             lastExecutingTaskKey: "",
             lastExecutionProgressSignature: "",
