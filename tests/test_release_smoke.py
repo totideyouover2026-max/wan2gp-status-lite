@@ -721,5 +721,33 @@ ok(Math.abs(legacy.state.records.encode.elapsed-10)<0.001,"legacy frontend timin
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+    def test_final_denoise_step_countdown_is_display_only(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is required for countdown validation")
+        javascript = _javascript_with_exports("freshState", "updateStepTiming", "finalDenoiseStepCountdown", "stageTimeText")
+        script = r'''
+const api=globalThis.__statusProReleaseTest,check=(value,message)=>{if(!value)throw new Error(message)};
+const state=api.freshState(),record=state.records.denoise;
+record.state="current";record.elapsed=12;record.startedAt=1000;
+for(const [step,at] of [[0,1000],[1,5000],[2,9000],[3,13000]])
+  api.updateStepTiming(record,{current:step,total:4,unit:"steps"},at);
+check(api.finalDenoiseStepCountdown(record,13000)==="~4s","final step estimate missing");
+check(api.finalDenoiseStepCountdown(record,15000)==="~2s","countdown did not advance");
+check(api.finalDenoiseStepCountdown(record,16000)==="Nearly done","overrun did not settle");
+check(api.finalDenoiseStepCountdown(record,30000)==="Nearly done","overrun showed negative time");
+check(record.stepCurrent===3&&record.stepTotal===4,"countdown changed native step state");
+record.state="aborting";
+check(api.finalDenoiseStepCountdown(record,16000)===null,"abort retained countdown");
+const segments=api.freshState().records.denoise;segments.state="current";segments.elapsed=12;
+for(const [step,at] of [[0,1000],[1,5000],[2,9000],[3,13000]])
+  api.updateStepTiming(segments,{current:step,total:4,unit:"segments"},at);
+check(api.finalDenoiseStepCountdown(segments,13000)===null,"segment counter triggered step countdown");
+'''
+        result = subprocess.run([node, "-"], input=javascript + "\n" + script,
+                                text=True, encoding="utf-8", capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

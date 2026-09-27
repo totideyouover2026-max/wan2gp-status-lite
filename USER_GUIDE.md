@@ -24,6 +24,8 @@ The live counter accumulates callback observations for the active queue task. Mu
 
 During denoising, the displayed step number describes the step currently running: an eight-step run starts at `Step 1/8` and reaches `Step 8/8` while the final step runs. The displayed total follows the configured step count. Layer, token, tile, and segment counters retain their reported values.
 
+On the final denoising step, the ETA counts down from recent completed step times when enough samples are available. If the estimate expires before WanGP reports the next stage, it says **Nearly done**.
+
 IndexTTS speech segment progress appears in Generate. Its vocoder conditioning and waveform generation appear in Decode. When switching from IndexTTS to another model, Prepare shows the outgoing unload followed by the incoming load.
 
 ## Minimized or background windows
