@@ -6,6 +6,7 @@
 - Improved IndexTTS stage reporting and the model unloading/loading handoff.
 - Display denoising as `Step n/N` from the first active step, while keeping layer and tile counters with their own phases.
 - Put expanded metrics on one row on wide panels, removed duplicate elapsed-time metrics, and prevented stale Encode layers from appearing during Denoising.
+- Restarted stage timing at each sliding-window boundary so Save from one window cannot hide progress in the next.
 
 ## 1.1.2 — 2026-09-22
 

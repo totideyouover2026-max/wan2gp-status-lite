@@ -270,6 +270,7 @@ class _StageTimingTelemetry:
         self._last_stage = None
         self._revision = 0
         self._execution_epoch = 0
+        self._window_no = None
         self._retired_task_ids = set()
 
     @staticmethod
@@ -305,10 +306,39 @@ class _StageTimingTelemetry:
             self._active_stage = None
             self._active_since = None
             self._last_stage = None
+            self._window_no = None
             self._execution_epoch += 1
             self._revision += 1
             self._observe_stage_locked("prepare", now)
             return self._execution_epoch
+
+    def observe_window(self, task_id, window_no, now=None, execution_epoch=None):
+        """Start fresh stage timing when a task advances to another sliding window."""
+        if task_id is None:
+            return False
+        try:
+            number = int(window_no)
+        except (TypeError, ValueError):
+            return False
+        if number < 1:
+            return False
+        now = self._now(now)
+        with self._lock:
+            if self._task_id != str(task_id) or (execution_epoch is not None and
+                    self._execution_epoch != int(execution_epoch)):
+                return False
+            if self._window_no is None:
+                self._window_no = number
+                return False
+            if number <= self._window_no:
+                return False
+            self._close_active(now)
+            self._stages = {}
+            self._last_stage = None
+            self._window_no = number
+            self._revision += 1
+            self._observe_stage_locked("prepare", now)
+            return True
 
     def _transition_allowed(self, stage_id):
         if self._active_stage is None or self._active_stage == stage_id:
@@ -1369,6 +1399,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             @wraps(callback)
             def observed_callback(*callback_args, **callback_kwargs):
                 nonlocal last_step_at, last_skip_count, phase_index, next_sequence, current_total
+                if stage_timing is not None:
+                    stage_timing.observe_window(task_id, gen.get("window_no"), execution_epoch=execution_epoch)
                 progress_unit = callback_kwargs.get("progress_unit", callback_args[8] if len(callback_args) > 8 else None)
                 # IndexTTS segment callbacks use read_state=True and otherwise
                 # leave the previous Prepare phase active.
@@ -1511,6 +1543,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             if callable(send_cmd):
                 @wraps(send_cmd)
                 def observed_send_cmd(command, data=None, *send_args, **send_kwargs):
+                    state_gen = state.get("gen") if isinstance(state, dict) and isinstance(state.get("gen"), dict) else {}
+                    self._stage_timing.observe_window(task_id, state_gen.get("window_no"), execution_epoch=execution_epoch)
                     phase = data
                     if command == "progress" and isinstance(data, (list, tuple)) and len(data) > 1:
                         phase = data[1]
@@ -1642,6 +1676,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 self._active_task_id = active_task.get("id")
                 timing_task_id = self._active_task_id
                 timing_epoch = self._stage_timing.start_task(timing_task_id)
+                self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
                 native_phase = _native_progress_snapshot(gen).get("phase")
                 _recover_polled_stage_timing(
                     self._stage_timing, timing_task_id, timing_epoch, native_phase,

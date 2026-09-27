@@ -22,6 +22,41 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_sliding_window_restarts_stage_timing_after_save(self):
+        scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_install_generation_timing_observer")
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["STRUCTURED_PHASE_STAGE_RULES"] = (
+            ("save", ("saving",)), ("encode", ("encoding",)),
+            ("denoise", ("denoising",)), ("prepare", ("preparing",)),
+        )
+        scope["_task_owned_stage_id"] = lambda task, phase: scope["_structured_stage_id"](phase)
+        timer = scope["_StageTimingTelemetry"]()
+        state = {"gen": {"window_no": 1}}
+        observed = []
+
+        def generate(task, send_cmd, state=None):
+            for phase in ("Encoding Text Prompt", "Denoising", "Saving output"):
+                send_cmd("status", phase)
+            first = timer.snapshot(task["id"])
+            observed.append(first)
+            state["gen"]["window_no"] = 2
+            for phase in ("Encoding Text Prompt", "Denoising"):
+                send_cmd("status", phase)
+            observed.append(timer.snapshot(task["id"]))
+            return True
+
+        owner = types.SimpleNamespace(_generation_timing_observer_installed=False,
+                                      _stage_timing=timer, _active_task_id=None, generate_media=generate)
+        owner.set_global = lambda name, value: setattr(owner, name, value)
+        scope["_install_generation_timing_observer"](owner)
+        owner.generate_media({"id": "sliding-task"}, lambda *args: None, state=state)
+        first, second = observed
+        self.assertTrue(first["stages"]["save"]["active"])
+        self.assertEqual(first["execution_epoch"], second["execution_epoch"])
+        self.assertEqual(second["last_stage"], "denoise")
+        self.assertTrue(second["stages"]["denoise"]["active"])
+        self.assertNotIn("save", second["stages"])
+
     def test_pre_epoch_global_save_cannot_seed_authoritative_task_timing(self):
         scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_recover_polled_stage_timing")
         scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
