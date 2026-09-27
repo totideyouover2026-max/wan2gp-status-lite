@@ -1843,8 +1843,6 @@ class StatusLitePlugin(WAN2GPPlugin):
       </div>
       <dl class="status-lite__metrics">
         <div><dt>Status</dt><dd data-sp-detail-state>Pending</dd></div>
-        <div><dt>Stage elapsed</dt><dd data-sp-detail-elapsed>—</dd></div>
-        <div><dt>Total elapsed</dt><dd data-sp-detail-total-elapsed>—</dd></div>
         <div data-sp-eta-metric><dt>Expected left</dt><dd data-sp-detail-eta>—</dd></div>
         <div data-sp-progress-metric><dt>Progress</dt><dd data-sp-detail-progress>—</dd></div>
         <div data-sp-step-metric hidden><dt>Avg step time</dt><dd data-sp-detail-step-time>—</dd></div>
@@ -3682,6 +3680,9 @@ class StatusLitePlugin(WAN2GPPlugin):
 
     function formatCounter(steps) {
         if (!steps || !Number.isFinite(steps.current) || !Number.isFinite(steps.total)) return "";
+        if (["step", "steps"].includes(String(steps.unit || "steps").toLowerCase())) {
+            return `Step ${steps.current}/${steps.total}`;
+        }
         return `${steps.current}/${steps.total} ${steps.unit || "steps"}`;
     }
 
@@ -4994,9 +4995,6 @@ class StatusLitePlugin(WAN2GPPlugin):
             modelElement.title = modelInfo ? modelInfo.text : "";
         }
         text(namespace.panel, "[data-sp-detail-state]", statusLabel(selected));
-        text(namespace.panel, "[data-sp-detail-elapsed]", Number.isFinite(selected.elapsed) ? formatDuration(selected.elapsed) : "—");
-        const totalElapsed = runTotalElapsed(namespace);
-        text(namespace.panel, "[data-sp-detail-total-elapsed]", Number.isFinite(totalElapsed) ? formatDuration(totalElapsed) : "—");
         text(namespace.panel, "[data-sp-detail-eta]", etaText);
         text(namespace.panel, "[data-sp-detail-progress]", Number.isFinite(selected.progress) ? `${selected.progress.toFixed(1)}%` : "—");
         const etaMetric = namespace.panel.querySelector("[data-sp-eta-metric]");

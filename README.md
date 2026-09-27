@@ -31,7 +31,7 @@ Status Lite and Status Pro are alternative presentations. You normally only need
 
 ## Live stage behavior
 
-Status Lite uses WanGP V13's native phase state first and retains nearby WangpProgress and legacy Gradio progress as compatibility fallbacks. Rich activities such as `Encoding Text Prompt · 50/50 layers`, `Denoising · 8/8 steps`, and `VAE Decoding · 28/28 tiles` remain inside the existing seven-stage timeline. Phase-local layer and tile counters stay separate from denoising step timing, cache-skip observations, and phase numbering.
+Status Lite uses WanGP V13's native phase state first and retains nearby WangpProgress and legacy Gradio progress as compatibility fallbacks. Rich activities such as `Encoding Text Prompt · 50/50 layers`, `Denoising · Step 8/8`, and `VAE Decoding · 28/28 tiles` remain inside the existing seven-stage timeline. Phase-local layer and tile counters stay separate from denoising step timing, cache-skip observations, and phase numbering.
 
 Sliding windows and post-processing subwindows remain part of the same live task. Their observed steps are accumulated while the task runs; Status Lite does not split them into saved records.
 

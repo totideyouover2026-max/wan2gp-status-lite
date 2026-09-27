@@ -576,9 +576,9 @@ function element(tag="div"){
 globalThis.document={createElement:element};
 ok(api.normalizePlannedStages(["Prepare","Generate","Enhance"]).join(",")==="prepare,denoise,post","display aliases created noncanonical stage IDs");
 const countState={state:api.freshState(),activeRun:{settings:{num_inference_steps:40}}};
-ok(api.displayDenoiseCounter(countState,{current:null,total:null,unit:"steps"})==="1/40 steps","first running step was blank");
-ok(api.displayDenoiseCounter(countState,{current:1,total:40,unit:"steps"})==="2/40 steps","completed step 1 did not show running step 2");
-ok(api.displayDenoiseCounter(countState,{current:39,total:40,unit:"steps"})==="40/40 steps","final running step was not shown");
+ok(api.displayDenoiseCounter(countState,{current:null,total:null,unit:"steps"})==="Step 1/40","first running step was blank");
+ok(api.displayDenoiseCounter(countState,{current:1,total:40,unit:"steps"})==="Step 2/40","completed step 1 did not show running step 2");
+ok(api.displayDenoiseCounter(countState,{current:39,total:40,unit:"steps"})==="Step 40/40","final running step was not shown");
 ok(api.displayDenoiseCounter(countState,{current:1,total:40,unit:"layers"})==="1/40 layers","layer counter was changed");
 const elapsedState={state:api.freshState(),activeRun:{started_at:Date.now()-5000}};
 ok(Math.abs(api.runTotalElapsed(elapsedState)-5)<0.5,"live total elapsed did not use run start time");

@@ -527,7 +527,7 @@ api.applySnapshot(decode, native(decode, "VAE Decoding", 4, 12, "tiles"));
 assert(Math.abs(decode.state.records.decode.progress - 100/3) < 0.001, "V13 Decode percentage lost");
 assert(api.formatCounter(decode.state.steps) === "4/12 tiles", "Decode substituted denoising counter");
 assert(api.formatCounter({current: 17, total: 32, unit: "layers"}) === "17/32 layers", "layer formatter");
-assert(api.formatCounter({current: 12, total: 30}) === "12/30 steps", "legacy counter default");
+assert(api.formatCounter({current: 12, total: 30}) === "Step 12/30", "legacy counter default");
 const legacy = namespace();
 legacy.state.records.denoise.stepTotal = 30;
 api.applySnapshot(legacy, {id: "decode", rawName: "VAE Decoding", rawMessage: "VAE Decoding", progress: 100,
