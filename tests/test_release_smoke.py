@@ -452,6 +452,18 @@ api.syncIdleModelLifecycle(ns);
 const switching = api.readLiveSnapshot(ns);
 check(ns.idleOperation === null && switching && switching.activity === "unload",
   "model-switch unload no longer belongs to Task B Prepare");
+ns.runTelemetry.status = "Loading model MiniMax H3";
+ns.activeRun._stageTimingEpoch = 1;
+ns.runTelemetry.stage_timing = {task_id:"B", execution_epoch:1,
+  stages:{prepare:{active:true}}};
+const loading = api.readLiveSnapshot(ns);
+check(loading && loading.activity === "load" && loading.id === "prepare",
+  "incoming model loading was hidden by the outgoing unload");
+ns.runTelemetry.model_lifecycle = null;
+ns.runTelemetry.native_progress = {phase:"Generating speech",current:1,total:2,unit:"segments"};
+ns.runTelemetry.stage_timing.stages = {denoise:{active:true}};
+check(api.readLiveSnapshot(ns).id === "denoise",
+  "stale loading status overrode IndexTTS generation");
 '''
         result = subprocess.run([node, "-"], input=javascript + "\n" + test_script,
                                 text=True, encoding="utf-8", capture_output=True, check=False)
@@ -547,7 +559,7 @@ ok(Object.values(ns.state.records).filter(r=>r.id!=="prepare").every(r=>!r.hasRu
             self.skipTest("Node is required for stage-presentation validation")
         javascript = _javascript_with_exports(
             "freshState", "applySnapshot", "renderStages", "readLiveSnapshot", "structuredStageId",
-            "applyServerStagePlan", "startRun", "normalizePlannedStages", "STAGE_DEFS",
+            "applyServerStagePlan", "startRun", "normalizePlannedStages", "displayDenoiseCounter", "runTotalElapsed", "STAGE_DEFS",
         )
         script = r"""
 const api=globalThis.__statusProReleaseTest,ok=(v,m)=>{if(!v)throw new Error(m)};
@@ -563,6 +575,15 @@ function element(tag="div"){
 }
 globalThis.document={createElement:element};
 ok(api.normalizePlannedStages(["Prepare","Generate","Enhance"]).join(",")==="prepare,denoise,post","display aliases created noncanonical stage IDs");
+const countState={state:api.freshState(),activeRun:{settings:{num_inference_steps:40}}};
+ok(api.displayDenoiseCounter(countState,{current:null,total:null,unit:"steps"})==="1/40 steps","first running step was blank");
+ok(api.displayDenoiseCounter(countState,{current:1,total:40,unit:"steps"})==="2/40 steps","completed step 1 did not show running step 2");
+ok(api.displayDenoiseCounter(countState,{current:39,total:40,unit:"steps"})==="40/40 steps","final running step was not shown");
+ok(api.displayDenoiseCounter(countState,{current:1,total:40,unit:"layers"})==="1/40 layers","layer counter was changed");
+const elapsedState={state:api.freshState(),activeRun:{started_at:Date.now()-5000}};
+ok(Math.abs(api.runTotalElapsed(elapsedState)-5)<0.5,"live total elapsed did not use run start time");
+elapsedState.activeRun=null;elapsedState.state.overallElapsed=12.5;
+ok(api.runTotalElapsed(elapsedState)===12.5,"completed total elapsed was not retained");
 const container=element();container.clientWidth=2000;
 const ns={state:api.freshState(),activeRun:{queue_task_id:"A",_stageTimingEpoch:1,_stagePlanEpoch:null,settings:{},step_performance:[]},
  panel:{querySelector:s=>s==="[data-sp-stages]"?container:null},
@@ -614,6 +635,11 @@ live.runTelemetry=phase("VAE Decoding","Generating","decode");
 ok(api.readLiveSnapshot(live).id==="decode","stale Generate text overrode structured Decode");
 live.runTelemetry=phase("Denoising","Encoding prompt","denoise");
 ok(api.readLiveSnapshot(live).id==="denoise","stale Encode text overrode structured Generate");
+live.runTelemetry=phase("Preparing vocoder conditioning","Generating speech","decode");
+live.runTelemetry.active_task.settings={model_type:"index_tts25"};
+ok(api.readLiveSnapshot(live).id==="decode","IndexTTS vocoder phase stayed in Generate");
+live.runTelemetry.native_progress.phase="Generating waveform";
+ok(api.readLiveSnapshot(live).id==="decode","IndexTTS waveform phase stayed in Generate");
 api.applySnapshot(live,snap("decode","VAE Decoding"));
 live.runTelemetry=phase("Uncatalogued accelerator phase","Encoding prompt","decode");
 const unknown=api.readLiveSnapshot(live);

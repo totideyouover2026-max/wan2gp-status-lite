@@ -4,6 +4,8 @@
 
 The header reports the current Wan2GP activity, total elapsed time, observed generation steps, and ETA when enough information is available. Select any visible stage card to inspect its status and timing.
 
+The detail panel shows **Stage elapsed** for the selected stage and **Total elapsed** since the current run began. Total elapsed remains visible in the header when the panel is collapsed.
+
 Stages appear only when relevant. Inputs, Enhance, and Save are optional; a model or workflow that does not report one of them will not be forced to display it as active work.
 
 WanGP V13 can provide activity counters such as `Encoding Text Prompt · 50/50 layers`, `Denoising · 8/8 steps`, and `VAE Decoding · 28/28 tiles`. These activities remain inside the existing seven top-level stages. Inputs, Encode, Generate, Decode, and Enhance can each show their detailed sub-activities, including repeated prompts, passes, or windows.
@@ -19,6 +21,10 @@ For gallery-applied LTX upscaling, `Distilled refinement` is part of Enhance. In
 ## Steps, passes, and subwindows
 
 The live counter accumulates callback observations for the active queue task. Multi-pass and LTX spatial-upscaler windows retain their phase/window labels. A two-window, eight-step upscaler can therefore show sixteen observations while still describing the configured work as two passes of eight steps.
+
+During denoising, the displayed step number describes the step currently running: an eight-step run starts at `1/8` and reaches `8/8` while the final step runs. The displayed total follows the configured step count. Layer, token, tile, and segment counters retain their reported values.
+
+IndexTTS speech segment progress appears in Generate. Its vocoder conditioning and waveform generation appear in Decode. When switching from IndexTTS to another model, Prepare shows the outgoing unload followed by the incoming load.
 
 ## Minimized or background windows
 
