@@ -498,7 +498,8 @@ def _native_progress_snapshot(gen):
         unit = units[1] if len(units) > 1 and isinstance(units[1], str) else None
     elif not unit and len(units) > 1 and isinstance(units[1], str):
         unit = units[1]
-    if (total is None or total <= 0) and re.search(r"\b(?:denois|diffus|sampl)\w*", phase, re.I):
+    is_denoising = re.search(r"\b(?:denois|diffus|sampl)\w*", phase, re.I)
+    if is_denoising and (total is None or total <= 0 or (unit and unit.lower() not in ("step", "steps"))):
         total = number(gen.get("num_inference_steps"))
         unit = "steps"
     if total is not None and total > 0:

@@ -181,6 +181,13 @@ class V13CompatibilityTests(unittest.TestCase):
         self.assertIsNone(normalize({"progress_phase": ["VAE Decoding", 4], "num_inference_steps": 30})["total"])
         legacy = normalize({"progress_phase": ["Denoising", 12], "num_inference_steps": 30})
         self.assertEqual((legacy["current"], legacy["total"], legacy["unit"], legacy["progress"]), (12, 30, "steps", 40))
+        for current in (0, 1, 7):
+            stale_encode = {"progress_phase": ["Denoising", current], "num_inference_steps": 8,
+                            "last_progress_args": [(0, 50), None, None, "layers"],
+                            "phase_progress_units": [50, "layers"]}
+            self.assertEqual(normalize(stale_encode),
+                             {"phase": "Denoising", "current": current, "total": 8,
+                              "unit": "steps", "progress": current / 8 * 100})
         self.assertEqual(normalize({"progress_phase": ["VAE Decoding", 13], "phase_progress_units": [12, "tiles"]})["progress"], 100)
         self.assertIn('"native_progress": _native_progress_snapshot(gen)', _source())
 
