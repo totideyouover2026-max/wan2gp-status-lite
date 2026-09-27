@@ -1,4 +1,10 @@
-# Status Lite 1.1.2
+# Status Lite 1.2.0
+
+Status Lite 1.2.0 adds total elapsed time and clearer live progress. Denoising displays `Step n/N` from the first active step; Encode layer and VAE tile counts stay with their own phases. IndexTTS reports its available stages, and task transitions distinguish outgoing model unloading from incoming model loading.
+
+The expanded panel shows its status metrics on one row when space permits. The final denoising step has a display-only countdown that starts from the average step time shown at the switchover and changes to “Nearly done” if the estimate runs over.
+
+## Status Lite 1.1.2
 
 Status Lite 1.1.2 stabilises task-owned live stage timing across queued and separate generations. Task identity and execution epoch are bound before progress callbacks, so fast Encode activity is retained and timing from a previous task cannot create or extend stages in the next task.
 

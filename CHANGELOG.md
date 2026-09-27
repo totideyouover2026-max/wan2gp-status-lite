@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 — 2026-09-27
+
+- Added total elapsed time to the header and a display-only final denoising step countdown based on the displayed average step time.
+- Improved IndexTTS stage reporting and the model unloading/loading handoff.
+- Display denoising as `Step n/N` from the first active step, while keeping layer and tile counters with their own phases.
+- Put expanded metrics on one row on wide panels, removed duplicate elapsed-time metrics, and prevented stale Encode layers from appearing during Denoising.
+
 ## 1.1.2 — 2026-09-22
 
 - Bound authoritative stage timing to task identity and execution epoch before generation callbacks can be recorded.
