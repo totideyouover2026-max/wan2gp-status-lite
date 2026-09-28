@@ -1098,6 +1098,15 @@ def _task_has_input_media(task):
     return has_effective_media_input(task)
 
 
+def _task_has_h3_vae_input(task):
+    """H3 video/audio guides can produce a separate VAE Encoding phase."""
+    if not isinstance(task, dict):
+        return False
+    params = task.get("params") if isinstance(task.get("params"), dict) else {}
+    keys = {"video_guide", "video_guide2", "video_source", "audio_guide", "audio_guide2", "audio_source"}
+    return any(_effective_media_value(values.get(key)) for values in (task, params) for key in keys)
+
+
 def _task_has_enhancement(task, settings):
     settings = settings if isinstance(settings, dict) else {}
     metadata = settings.get("postprocessing")
@@ -1127,8 +1136,14 @@ def plan_stages_for_task(task, telemetry_context=None):
     yue2 = _task_is_yue2(task, settings)
     yue2_hum = _task_is_yue2_hum(task, settings)
     plan = ["prepare"]
+    # H3 image references may be consumed during prompt conditioning, whereas
+    # video/audio guides can produce a separate VAE Encoding callback.
+    if h3 and _task_has_h3_vae_input(task):
+        plan.append("input")
     if not yue2:
         plan.append("encode")
+    # Other media models retain their observed Encode -> Inputs ordering.
+    # YuE2 exposes Inputs only for its Hum-to-Song carrier encoder.
     if yue2_hum or (_task_has_input_media(task) and not h3 and not yue2):
         plan.append("input")
     plan.extend(("denoise", "decode"))
@@ -3427,7 +3442,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (Number.isFinite(activeRun._stagePlanEpoch) && activeRun._stagePlanEpoch !== epoch) return false;
         if (state.stagePlanLocked) return state.stagePlanTaskId === String(taskId) && state.stagePlanEpoch === epoch;
         const discovered = STAGE_DEFS.map(stage => stage.id).filter(id => state.records[id] && state.records[id].hasRun);
-        state.plannedStages = [...plan, ...discovered.filter(id => !plan.includes(id))];
+        state.plannedStages = plan.slice();
+        discovered.forEach(id => ensureStageInPlan(state, id));
         state.plannedStages.forEach(id => { state.records[id].visible = true; });
         state.stagePlanLocked = true;
         state.stagePlanTaskId = String(taskId);
@@ -3442,7 +3458,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!state || !STAGE_ID_SET.has(stageId)) return false;
         if (!Array.isArray(state.plannedStages)) state.plannedStages = DEFAULT_PLANNED_STAGES.slice();
         if (!state.plannedStages.includes(stageId)) {
-            state.plannedStages.push(stageId);
+            const stageRank = STAGE_DEFS.findIndex(stage => stage.id === stageId);
+            const nextIndex = state.plannedStages.findIndex(id =>
+                STAGE_DEFS.findIndex(stage => stage.id === id) > stageRank
+            );
+            if (nextIndex < 0) state.plannedStages.push(stageId);
+            else state.plannedStages.splice(nextIndex, 0, stageId);
             if (!Array.isArray(state.runtimeDiscoveredStages)) state.runtimeDiscoveredStages = [];
             if (!state.runtimeDiscoveredStages.includes(stageId)) state.runtimeDiscoveredStages.push(stageId);
         }
@@ -4965,8 +4986,16 @@ class StatusLitePlugin(WAN2GPPlugin):
                 const timing = document.createElement("span");
                 timing.className = "status-lite__stage-time";
                 button.append(icon, name, timing);
-                container.appendChild(button);
+                const nextId = plannedIds.slice(plannedIndex + 1).find(id => existing.has(id));
+                if (nextId && typeof container.insertBefore === "function") {
+                    container.insertBefore(button, existing.get(nextId));
+                } else {
+                    container.appendChild(button);
+                }
+                existing.set(def.id, button);
             }
+            button.dataset.stagePosition = String(plannedIndex + 1);
+            button.style.order = String(plannedIndex);
             const selected = state.selectedId === def.id;
             button.classList.toggle("status-lite__stage--reserved", false);
             button.disabled = false;

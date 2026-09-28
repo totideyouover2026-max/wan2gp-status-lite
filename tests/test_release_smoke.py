@@ -568,6 +568,7 @@ function element(tag="div"){
  const node={tagName:tag,dataset:{},style:{},children:[],attributes:{},className:"",disabled:false,title:"",
   classList:{values:new Set(),toggle(name,on){if(on)this.values.add(name);else this.values.delete(name)},contains(name){return this.values.has(name)}},
   append(...items){items.forEach(item=>this.children.push(item))},appendChild(item){this.children.push(item);return item},
+  insertBefore(item,before){const index=this.children.indexOf(before);this.children.splice(index<0?this.children.length:index,0,item);return item},
   setAttribute(name,value){this.attributes[name]=String(value)},
   querySelectorAll(selector){return selector==="[data-stage-id]"?this.children.filter(x=>x.dataset.stageId):[]},
   querySelector(selector){const cls=selector.replace(/^\./,"");return this.children.find(x=>x.className===cls)||null}};
@@ -594,6 +595,12 @@ ok(container.children.map(x=>x.dataset.stagePosition).join(",")==="1,2,3,4","fal
 const plan=(id,epoch,stages)=>({planned_stages:stages,planned_stage_task_id:id,
  planned_stage_execution_epoch:epoch,planned_stage_revision:epoch,
  stage_timing:{task_id:id,execution_epoch:epoch,revision:1,last_stage:"prepare",stages:{}}});
+api.applySnapshot(ns,{id:"input",rawName:"VAE Encoding",rawMessage:"VAE Encoding",progress:null,
+ steps:{current:null,total:null,unit:null},stageElapsed:null,overallElapsed:null,transitionEvidence:"structured",aborting:false});
+api.renderStages(ns);
+ok(container.children.map(x=>x.dataset.stageId).join(",")==="prepare,input,encode,denoise,decode","unexpected Inputs was appended after later stages");
+ok(container.children.map(x=>x.dataset.stagePosition).join(",")==="1,2,3,4,5","inserted Inputs numbering was not updated");
+api.startRun(ns,{id:"A",settings:{}},plan("A",1,["prepare","encode","denoise","decode"]));
 ok(api.applyServerStagePlan(ns,plan("A",1,["prepare","encode","denoise","decode"])),"Task A plan rejected");
 api.renderStages(ns);
 let refs=[...container.children];

@@ -146,7 +146,7 @@ class V13CompatibilityTests(unittest.TestCase):
             self.assertIn(token, _source())
         scope = python_helpers(
             "_configured_task_value", "_effective_media_value", "has_effective_media_input",
-            "_task_has_input_media", "_task_has_enhancement", "_task_model_type", "_task_is_h3",
+            "_task_has_input_media", "_task_has_h3_vae_input", "_task_has_enhancement", "_task_model_type", "_task_is_h3",
             "_task_is_yue2", "_task_is_yue2_hum", "plan_stages_for_task"
         )
         scope["PLANNED_STAGE_IDS"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
@@ -176,7 +176,11 @@ class V13CompatibilityTests(unittest.TestCase):
         self.assertEqual(combined.count("input"), 1)
         h3_media = {"params": {"model_type": "minimax_h3_ref2va_pruned", "image_refs": ["ref.png"],
                                "video_guide": "guide.mp4", "audio_guide": "voice.wav"}}
-        self.assertEqual(plan(h3_media), ["prepare", "encode", "denoise", "decode", "save"])
+        self.assertEqual(plan(h3_media), ["prepare", "input", "encode", "denoise", "decode", "save"])
+        self.assertEqual(
+            plan({"params": {"model_type": "minimax_h3_ref2va_pruned", "image_refs": ["ref.png"]}}),
+            ["prepare", "encode", "denoise", "decode", "save"],
+        )
         self.assertEqual(
             plan({"params": {"model_type": "yue2"}}),
             ["prepare", "denoise", "decode", "save"],
