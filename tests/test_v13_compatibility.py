@@ -29,7 +29,7 @@ class V13CompatibilityTests(unittest.TestCase):
             ("save", ("saving",)), ("encode", ("encoding",)),
             ("denoise", ("denoising",)), ("prepare", ("preparing",)),
         )
-        scope["_task_owned_stage_id"] = lambda task, phase: scope["_structured_stage_id"](phase)
+        scope["_task_owned_stage_id"] = lambda task, phase, timing=None: scope["_structured_stage_id"](phase)
         timer = scope["_StageTimingTelemetry"]()
         state = {"gen": {"window_no": 1}}
         observed = []
@@ -482,6 +482,28 @@ class V13CompatibilityTests(unittest.TestCase):
         third = lifecycle.begin_unload("flux", "Extensions")
         self.assertEqual(first, third)
 
+
+    def test_h3_ref2va_early_decode_is_input_work(self):
+        scope = python_helpers(
+            "_StageTimingTelemetry", "_structured_stage_id", "_task_model_type", "_task_is_yue2",
+            "_task_owned_stage_id"
+        )
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
+        scope["STRUCTURED_PHASE_STAGE_RULES"] = (
+            ("encode", ("encoding text prompt",)), ("denoise", ("denoising",)),
+            ("decode", ("vae decoding",)),
+        )
+        timer = scope["_StageTimingTelemetry"]()
+        task = {"id": "h3", "params": {"model_type": "minimax_h3_ref2va_pruned_pdd"}}
+        owned = scope["_task_owned_stage_id"]
+        timer.start_task("h3", now=0)
+        self.assertEqual(owned(task, "VAE Decoding", timer), "input")
+        timer.observe_stage("h3", "input", now=1)
+        timer.observe_stage("h3", owned(task, "Encoding Text Prompt", timer), now=3)
+        timer.observe_stage("h3", "denoise", now=5)
+        self.assertEqual(owned(task, "VAE Decoding", timer), "decode")
+        timer.observe_stage("h3", "decode", now=7)
+        self.assertEqual(timer.snapshot("h3", now=8)["last_stage"], "decode")
 
     def test_native_dom_sequences_decode_cancellation_and_qwen(self):
         node = shutil.which("node")
