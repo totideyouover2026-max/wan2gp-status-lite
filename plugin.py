@@ -276,6 +276,7 @@ class _StageTimingTelemetry:
         self._last_stage = None
         self._revision = 0
         self._execution_epoch = 0
+        self._task_finished = False
         self._window_no = None
         self._retired_task_ids = set()
 
@@ -293,13 +294,13 @@ class _StageTimingTelemetry:
         self._active_since = None
         self._revision += 1
 
-    def start_task(self, task_id, now=None):
+    def start_task(self, task_id, now=None, new_execution=False):
         if task_id is None:
             return None
         now = self._now(now)
         key = str(task_id)
         with self._lock:
-            if self._task_id == key:
+            if self._task_id == key and not (new_execution and self._task_finished):
                 return self._execution_epoch
             if self._task_id is not None:
                 self._close_active(now, completed=False)
@@ -308,6 +309,7 @@ class _StageTimingTelemetry:
                     self._retired_task_ids = set(list(self._retired_task_ids)[-32:])
             self._retired_task_ids.discard(key)
             self._task_id = key
+            self._task_finished = False
             self._stages = {}
             self._active_stage = None
             self._active_since = None
@@ -402,6 +404,7 @@ class _StageTimingTelemetry:
             if task_id is not None and self._task_id != str(task_id):
                 return
             self._close_active(now, completed=completed)
+            self._task_finished = True
 
     def snapshot(self, task_id=None, now=None):
         now = self._now(now)
@@ -1551,7 +1554,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         def observed(task, *args, **kwargs):
             task_id = task.get("id") if isinstance(task, dict) else None
             self._active_task_id = task_id
-            execution_epoch = self._stage_timing.start_task(task_id)
+            execution_epoch = self._stage_timing.start_task(task_id, new_execution=True)
             task_outcomes = getattr(self, "_task_outcomes", None)
             if task_outcomes is not None:
                 task_outcomes.begin(task_id, execution_epoch)
@@ -2812,14 +2815,18 @@ class StatusLitePlugin(WAN2GPPlugin):
         return null;
     }
 
+    function yueTokenCounter(rawName) {
+        return String(rawName || "").match(/\bYuE2\s+(?:semantic audio|score):\s*(\d+(?:\.\d+)?)\s+tokens?\s*$/i);
+    }
+
     function normalizedPhaseLabel(rawName, progress) {
         let label = String(rawName || "Preparing").trim() || "Preparing";
         const current = optionalNumber(progress && progress.current);
         const total = optionalNumber(progress && progress.total);
         const unit = String(progress && progress.unit || "").trim().toLowerCase();
-        if (Number.isFinite(current) && Number.isFinite(total) && unit) {
+        if (yueTokenCounter(label) || (Number.isFinite(current) && Number.isFinite(total) && unit)) {
             const suffix = label.match(/:\s*\d+(?:\.\d+)?\s+(tokens?|tiles?|layers?|steps?)\s*$/i);
-            if (suffix && suffix[1].toLowerCase().replace(/s$/, "") === unit.replace(/s$/, "")) {
+            if (suffix && (yueTokenCounter(label) || suffix[1].toLowerCase().replace(/s$/, "") === unit.replace(/s$/, ""))) {
                 label = label.slice(0, suffix.index).trim();
             }
         }
@@ -3600,6 +3607,11 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (namespace.activeRun) observePerformanceTelemetry(namespace.activeRun, telemetry);
 
         if (task) {
+            if (namespace.activeRun && activeKey === nextKey && nextExecutionKey &&
+                Number.isFinite(namespace.activeRun._stageTimingEpoch) &&
+                namespace.activeRun._stageTimingEpoch !== optionalNumber(telemetry.stage_timing.execution_epoch)) {
+                finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
+            }
             const terminalOutcome = namespace.activeRun && taskOutcomeForRun(namespace.activeRun, telemetry);
             if (terminalOutcome && terminalOutcome.known === true) {
                 finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
@@ -3615,8 +3627,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                 namespace.lastExecutionProgressSignature = progressSignature;
                 return;
             }
+            const ownedTiming = telemetry.stage_timing;
+            const freshOwnedStage = nextExecutionKey && ownedTiming && ownedTiming.stages &&
+                Object.values(ownedTiming.stages).some(stage => stage && stage.active === true &&
+                    ownedTiming.last_stage !== "prepare");
             if (namespace.activeRun && namespace.progressEpochReady === false &&
-                progressSignature !== previousSignature) namespace.progressEpochReady = true;
+                (progressSignature !== previousSignature || freshOwnedStage)) namespace.progressEpochReady = true;
             if (namespace.activeRun && activeKey && activeKey !== nextKey) {
                 finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
             }
@@ -3745,7 +3761,10 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function formatCounter(steps) {
-        if (!steps || !Number.isFinite(steps.current) || !Number.isFinite(steps.total)) return "";
+        if (!steps || !Number.isFinite(steps.current)) return "";
+        if (!Number.isFinite(steps.total)) {
+            return /^tokens?$/i.test(String(steps.unit || "")) ? `${steps.current} tokens` : "";
+        }
         if (["step", "steps"].includes(String(steps.unit || "steps").toLowerCase())) {
             return `Step ${steps.current}/${steps.total}`;
         }
@@ -4424,6 +4443,16 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function applySnapshot(namespace, snapshot) {
+        const tokenCounter = yueTokenCounter(snapshot.rawName) || yueTokenCounter(snapshot.rawMessage);
+        if (tokenCounter && !snapshot.aborting) {
+            const tokenTotal = /^tokens?$/i.test(String(snapshot.steps && snapshot.steps.unit || ""))
+                ? optionalNumber(snapshot.steps && snapshot.steps.total) : null;
+            const current = Number(tokenCounter[1]);
+            snapshot = {...snapshot, rawName: normalizedPhaseLabel(snapshot.rawName),
+                steps: {current, total: tokenTotal, unit: "tokens"}, progressScope: "phase",
+                progress: tokenTotal > 0 ? clamp(current / tokenTotal * 100, 0, 100) : null,
+                nativeEta: null};
+        }
         const state = namespace.state;
         const now = Date.now();
         if (!namespace.activeRun && state.inactiveSince && now - state.inactiveSince > RESET_AFTER_MS) {

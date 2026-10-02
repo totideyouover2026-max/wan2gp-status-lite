@@ -22,6 +22,21 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_completed_task_id_gets_fresh_worker_execution(self):
+        scope = python_helpers("_StageTimingTelemetry")
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "encode", "denoise", "save")
+        timer = scope["_StageTimingTelemetry"]()
+        first = timer.start_task(1, now=0, new_execution=True)
+        timer.observe_stage(1, "save", now=1, execution_epoch=first)
+        timer.finish_task(1, now=2, completed=True)
+        self.assertEqual(timer.start_task(1, now=3), first)  # Lingering poll.
+        second = timer.start_task(1, now=4, new_execution=True)
+        self.assertGreater(second, first)
+        self.assertEqual(set(timer.snapshot(1, now=5)["stages"]), {"prepare"})
+        self.assertFalse(timer.observe_stage(1, "save", now=5, execution_epoch=first))
+        self.assertTrue(timer.observe_stage(1, "denoise", now=6, execution_epoch=second))
+        self.assertEqual(timer.start_task(1, now=7), second)
+
     def test_sliding_window_restarts_stage_timing_after_save(self):
         scope = python_helpers("_StageTimingTelemetry", "_structured_stage_id", "_install_generation_timing_observer")
         scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "input", "encode", "denoise", "decode", "post", "save")
@@ -558,6 +573,18 @@ for (const phase of ["Preparing Conditioning", "Encoding Text Prompt 1/2", "Prep
     api.applySnapshot(repeated, native(repeated, phase));
 }
 assert(api.stageActivities(repeated.state, repeated.state.records.encode).length === 4, "repeated subphase overwritten");
+const legacyYue = namespace();
+for (const count of [435, 465, 495, 1286]) {
+    api.applySnapshot(legacyYue, native(legacyYue, `Denoising | YuE2 semantic audio: ${count} tokens`, 9000, 9000, "steps"));
+}
+const tokenRows = api.stageActivities(legacyYue.state, legacyYue.state.records.denoise);
+assert(tokenRows.length === 1, "YuE2 labels with native step counters created multiple rows");
+assert(tokenRows[0].current === 1286 && tokenRows[0].total === null && tokenRows[0].unit === "tokens",
+    "YuE2 embedded token count was replaced by native steps");
+api.applySnapshot(legacyYue, native(legacyYue, "YuE2 acoustic synthesis", 14, 32, "steps"));
+const completedTokens = api.stageActivities(legacyYue.state, legacyYue.state.records.denoise);
+assert(completedTokens.length === 2 && completedTokens[0].current === 1286,
+    "Acoustic synthesis duplicated or overwrote semantic tokens");
 const yue = namespace();
 for (const count of [41, 81, 121]) {
     api.applySnapshot(yue, native(yue, `Denoising | YuE2 semantic audio: ${count} tokens`, count, 9000, "tokens"));

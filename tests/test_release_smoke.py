@@ -402,6 +402,15 @@ direct.runTelemetry=t(null,"Saved",{in_progress:false,queue_length:0});api.syncR
 direct.runTelemetry=t(B,"Saved",{queue_length:1});api.syncRunTelemetry(direct);
 ok(direct.state.currentId==="prepare"&&direct.state.records.prepare.isActive&&!direct.state.records.save.hasRun&&api.readLiveSnapshot(direct)===null,
  "separate H3 run inherited the earlier run's Save DOM");
+// Task-owned timing advances even when global text remains unchanged.
+direct.runTelemetry=t(B,"Saved",{stage_timing:bDenoise});api.syncRunTelemetry(direct);
+ok(direct.progressEpochReady&&direct.state.currentId==="denoise","unchanged global text blocked fresh worker timing");
+// A reused task ID is a new execution when the worker epoch changes.
+direct.runTelemetry=t(null,"Saved",{in_progress:false,queue_length:0});api.syncRunTelemetry(direct);
+const reusedTiming={...bEncode,execution_epoch:9};
+direct.runTelemetry=t(B,"Encoding Prompt",{stage_timing:reusedTiming});api.syncRunTelemetry(direct);
+ok(direct.activeRun&&direct.activeRun._stageTimingEpoch===9&&direct.state.currentId==="encode",
+ "reused task ID retained completed timing");
 const legacy={...t(A,"Preparing")};delete legacy.execution_task_known;delete legacy.executing_task;
 legacy.active_task=A;ns.activeRun=null;sync(legacy);ok(ns.activeRun.queue_task_id==="A","legacy fallback regressed");
 """
