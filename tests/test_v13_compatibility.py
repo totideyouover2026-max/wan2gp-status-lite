@@ -22,6 +22,18 @@ def python_helpers(*names):
 
 
 class V13CompatibilityTests(unittest.TestCase):
+    def test_next_sample_resets_stage_timing_within_task(self):
+        scope = python_helpers("_StageTimingTelemetry")
+        scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "encode", "denoise", "decode", "save")
+        timer = scope["_StageTimingTelemetry"]()
+        epoch = timer.start_task("same-task", now=0)
+        self.assertFalse(timer.observe_sample("same-task", 1, now=0, execution_epoch=epoch))
+        timer.observe_stage("same-task", "save", now=10, execution_epoch=epoch)
+        self.assertTrue(timer.observe_sample("same-task", 2, now=12, execution_epoch=epoch))
+        self.assertEqual(set(timer.snapshot("same-task", now=13)["stages"]), {"prepare"})
+        self.assertTrue(timer.observe_stage("same-task", "encode", now=14, execution_epoch=epoch))
+        self.assertFalse(timer.observe_sample("same-task", 3, now=15, execution_epoch=epoch + 1))
+
     def test_completed_task_id_gets_fresh_worker_execution(self):
         scope = python_helpers("_StageTimingTelemetry")
         scope["STRUCTURED_STAGE_ORDER"] = ("prepare", "encode", "denoise", "save")

@@ -411,6 +411,20 @@ const reusedTiming={...bEncode,execution_epoch:9};
 direct.runTelemetry=t(B,"Encoding Prompt",{stage_timing:reusedTiming});api.syncRunTelemetry(direct);
 ok(direct.activeRun&&direct.activeRun._stageTimingEpoch===9&&direct.state.currentId==="encode",
  "reused task ID retained completed timing");
+const extra={state:api.freshState(),source,container:ns.container,download:ns.download,
+ historyRecording:false,runHistory:[],sessionRunIds:new Set(),sessionId:"extra",lastExecutingTaskKey:"",
+ lastExecutionProgressSignature:"",progressEpochReady:true};
+extra.runTelemetry=t(A,"Saving",{sample_no:1,output_records:[{path:"first.mp4",settings:{}}]});
+api.syncRunTelemetry(extra);api.applySnapshot(extra,api.readLiveSnapshot(extra));
+ok(extra.state.currentId==="save"&&extra.activeRun.sample_no===1,"first sample was not tracked");
+extra.runTelemetry=t(A,"Preparing",{sample_no:2,server_time:20,
+ output_records:[{path:"first.mp4",settings:{}}]});api.syncRunTelemetry(extra);
+ok(extra.activeRun&&extra.activeRun.sample_no===2&&extra.state.currentId==="prepare"&&
+ !extra.state.records.save.hasRun,"One More inherited the first sample's Save stage");
+extra.runTelemetry=t(A,"Encoding Text Prompt",{sample_no:2,server_time:21,
+ output_records:[{path:"first.mp4",settings:{}}]});api.syncRunTelemetry(extra);
+const extraSnapshot=api.readLiveSnapshot(extra);api.applySnapshot(extra,extraSnapshot);
+ok(extraSnapshot.id==="encode"&&extra.state.currentId==="encode","One More did not resume stage tracking");
 const legacy={...t(A,"Preparing")};delete legacy.execution_task_known;delete legacy.executing_task;
 legacy.active_task=A;ns.activeRun=null;sync(legacy);ok(ns.activeRun.queue_task_id==="A","legacy fallback regressed");
 """

@@ -280,6 +280,7 @@ class _StageTimingTelemetry:
         self._execution_epoch = 0
         self._task_finished = False
         self._window_no = None
+        self._sample_no = None
         self._retired_task_ids = set()
 
     @staticmethod
@@ -317,6 +318,7 @@ class _StageTimingTelemetry:
             self._active_since = None
             self._last_stage = None
             self._window_no = None
+            self._sample_no = None
             self._execution_epoch += 1
             self._revision += 1
             self._observe_stage_locked("prepare", now)
@@ -346,6 +348,33 @@ class _StageTimingTelemetry:
             self._stages = {}
             self._last_stage = None
             self._window_no = number
+            self._revision += 1
+            self._observe_stage_locked("prepare", now)
+            return True
+
+    def observe_sample(self, task_id, sample_no, now=None, execution_epoch=None):
+        """Start stage timing for another sample in the same WanGP task."""
+        try:
+            number = int(sample_no)
+        except (TypeError, ValueError):
+            return False
+        if number < 1:
+            return False
+        now = self._now(now)
+        with self._lock:
+            if self._task_id != str(task_id) or (execution_epoch is not None and
+                    self._execution_epoch != int(execution_epoch)):
+                return False
+            if self._sample_no is None:
+                self._sample_no = number
+                return False
+            if number <= self._sample_no:
+                return False
+            self._close_active(now)
+            self._stages = {}
+            self._last_stage = None
+            self._window_no = None
+            self._sample_no = number
             self._revision += 1
             self._observe_stage_locked("prepare", now)
             return True
@@ -1426,6 +1455,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             def observed_callback(*callback_args, **callback_kwargs):
                 nonlocal last_step_at, last_skip_count, phase_index, next_sequence, current_total
                 if stage_timing is not None:
+                    stage_timing.observe_sample(task_id, gen.get("repeat_no"), execution_epoch=execution_epoch)
                     stage_timing.observe_window(task_id, gen.get("window_no"), execution_epoch=execution_epoch)
                 progress_unit = callback_kwargs.get("progress_unit", callback_args[8] if len(callback_args) > 8 else None)
                 # IndexTTS segment callbacks use read_state=True and otherwise
@@ -1570,6 +1600,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 @wraps(send_cmd)
                 def observed_send_cmd(command, data=None, *send_args, **send_kwargs):
                     state_gen = state.get("gen") if isinstance(state, dict) and isinstance(state.get("gen"), dict) else {}
+                    self._stage_timing.observe_sample(task_id, state_gen.get("repeat_no"), execution_epoch=execution_epoch)
                     self._stage_timing.observe_window(task_id, state_gen.get("window_no"), execution_epoch=execution_epoch)
                     phase = data
                     if command == "progress" and isinstance(data, (list, tuple)) and len(data) > 1:
@@ -1702,6 +1733,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 self._active_task_id = active_task.get("id")
                 timing_task_id = self._active_task_id
                 timing_epoch = self._stage_timing.start_task(timing_task_id)
+                self._stage_timing.observe_sample(timing_task_id, gen.get("repeat_no"), execution_epoch=timing_epoch)
                 self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
                 native_phase = _native_progress_snapshot(gen).get("phase")
                 _recover_polled_stage_timing(
@@ -1749,6 +1781,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                 "active_task": active_task,
                 "sliding_window": bool(gen.get("sliding_window")),
                 "window_no": _telemetry_value(gen.get("window_no")),
+                "sample_no": _telemetry_value(gen.get("repeat_no")),
+                "total_samples": _telemetry_value(gen.get("total_generation")),
                 "total_windows": _telemetry_value(gen.get("total_windows")),
                 "status": str(gen.get("status") or "")[:2000],
                 "progress_phase": _telemetry_value(gen.get("progress_phase")),
@@ -3524,7 +3558,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             _stageTimingEpoch: initialStageTimingMatches ? initialStageTimingEpoch : null,
             _stagePlanEpoch: null,
             outputs: [],
-            repeats: optionalNumber(task && task.repeats) || 1,
+            repeats: sampleNumber(telemetry) ? 1 : (optionalNumber(task && task.repeats) || 1),
+            sample_no: sampleNumber(telemetry) || 1,
             window_no: window.number,
             total_windows: window.total,
             window_prompt: windowPrompt,
@@ -3554,7 +3589,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             namespace.activeRun.window_prompt = windowPrompt;
             namespace.activeRun.settings.prompt = namespace.activeRun.window_prompt;
         }
-        namespace.activeRun.repeats = optionalNumber(task.repeats) || namespace.activeRun.repeats || 1;
+        namespace.activeRun.repeats = sampleNumber(telemetry) ? 1 :
+            (optionalNumber(task.repeats) || namespace.activeRun.repeats || 1);
         observePerformanceTelemetry(namespace.activeRun, telemetry);
     }
 
@@ -3590,6 +3626,11 @@ class StatusLitePlugin(WAN2GPPlugin):
             progress_phase: telemetry.progress_phase || null,
             native_progress: telemetry.native_progress || null
         });
+    }
+
+    function sampleNumber(telemetry) {
+        const number = optionalNumber(telemetry && telemetry.sample_no);
+        return Number.isFinite(number) && number > 0 ? Math.floor(number) : null;
     }
 
     function syncRunTelemetry(namespace) {
@@ -3635,6 +3676,13 @@ class StatusLitePlugin(WAN2GPPlugin):
                     ownedTiming.last_stage !== "prepare");
             if (namespace.activeRun && namespace.progressEpochReady === false &&
                 (progressSignature !== previousSignature || freshOwnedStage)) namespace.progressEpochReady = true;
+            const nextSample = sampleNumber(telemetry);
+            if (namespace.activeRun && activeKey === nextKey && Number.isFinite(nextSample) &&
+                nextSample > namespace.activeRun.sample_no) {
+                finishRun(namespace, "completed", now, telemetry);
+                startRun(namespace, task, telemetry);
+                namespace.progressEpochReady = false;
+            }
             if (namespace.activeRun && activeKey && activeKey !== nextKey) {
                 finishRun(namespace, runStatusFrom(namespace, telemetry), now, telemetry);
             }
