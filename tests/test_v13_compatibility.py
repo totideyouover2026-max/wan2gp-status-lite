@@ -498,7 +498,7 @@ class V13CompatibilityTests(unittest.TestCase):
         self.assertEqual(first, third)
 
 
-    def test_h3_ref2va_early_decode_is_input_work(self):
+    def test_h3_ref2va_prompt_preview_decode_is_encode_work(self):
         scope = python_helpers(
             "_StageTimingTelemetry", "_structured_stage_id", "_task_model_type", "_task_is_yue2",
             "_task_owned_stage_id"
@@ -512,13 +512,17 @@ class V13CompatibilityTests(unittest.TestCase):
         task = {"id": "h3", "params": {"model_type": "minimax_h3_ref2va_pruned_pdd"}}
         owned = scope["_task_owned_stage_id"]
         timer.start_task("h3", now=0)
-        self.assertEqual(owned(task, "VAE Decoding", timer), "input")
-        timer.observe_stage("h3", "input", now=1)
-        timer.observe_stage("h3", owned(task, "Encoding Text Prompt", timer), now=3)
+        self.assertEqual(owned(task, "VAE Decoding", timer), "encode")
+        timer.observe_stage("h3", owned(task, "Encoding Text Prompt", timer), now=1)
+        self.assertEqual(owned(task, "VAE Decoding", timer), "encode")
+        timer.observe_stage("h3", owned(task, "VAE Decoding", timer), now=3)
         timer.observe_stage("h3", "denoise", now=5)
         self.assertEqual(owned(task, "VAE Decoding", timer), "decode")
         timer.observe_stage("h3", "decode", now=7)
         self.assertEqual(timer.snapshot("h3", now=8)["last_stage"], "decode")
+        timer.start_task("next", now=10)
+        next_task = {"id": "next", "params": {"model_type": "minimax_h3_ref2va_pruned_pdd"}}
+        self.assertEqual(owned(next_task, "VAE Decoding", timer), "encode")
 
     def test_native_dom_sequences_decode_cancellation_and_qwen(self):
         node = shutil.which("node")
@@ -546,6 +550,26 @@ for (const [phase, id] of [["VAE Encoding", "input"], ["Preparing Conditioning",
     ["Encoding Text Prompt 1/2", "encode"], ["Denoising", "denoise"], ["VAE Decoding", "decode"]]) {
     assert(api.stageIdFor(phase) === id, `wrong mapping: ${phase}`);
 }
+const h3Preview = namespace();
+h3Preview.activeRun.queue_task_id = "next";
+h3Preview.activeRun._stageTimingEpoch = 2;
+h3Preview.activeRun.settings.model_type = "minimax_h3_ref2va_pruned_pdd";
+h3Preview.runTelemetry = {execution_task_known: true,
+    native_progress: {phase: "VAE Decoding", current: 50, total: 50, unit: "tiles"},
+    active_task: {settings: h3Preview.activeRun.settings},
+    stage_timing: {task_id: "next", execution_epoch: 2, stages: {encode: {active: true}}}};
+const preview = api.readReportedPhaseStatus(h3Preview);
+assert(preview.id === "encode", "prompt preview decode appeared in Decode");
+api.applySnapshot(h3Preview, preview);
+assert(h3Preview.state.currentId === "encode" && !h3Preview.state.records.decode.hasRun,
+    "prompt preview activated Decode");
+h3Preview.runTelemetry.stage_timing.stages = {denoise: {active: true}};
+h3Preview.runTelemetry.native_progress = {phase: "Denoising", current: 1, total: 8, unit: "steps"};
+api.applySnapshot(h3Preview, api.readReportedPhaseStatus(h3Preview));
+assert(h3Preview.state.currentId === "denoise", "prompt preview blocked Generate");
+h3Preview.runTelemetry.stage_timing.stages = {decode: {active: true}};
+h3Preview.runTelemetry.native_progress = {phase: "VAE Decoding", current: 1, total: 50, unit: "tiles"};
+assert(api.readReportedPhaseStatus(h3Preview).id === "decode", "output decode left Decode");
 for (const sequence of [
     ["Preparing", "Encoding Text Prompt", "Denoising", "VAE Decoding", "Saving"],
     ["Preparing", "VAE Encoding", "Preparing Conditioning", "Encoding Text Prompt", "Denoising", "VAE Decoding", "Saving"],

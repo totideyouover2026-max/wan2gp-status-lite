@@ -250,8 +250,10 @@ def _task_owned_stage_id(task, raw_phase, stage_timing=None):
             _task_model_type(task).startswith("minimax_h3_ref2va")):
         timing = stage_timing.snapshot(task.get("id") if isinstance(task, dict) else None)
         stages = timing.get("stages", {})
-        if not any(stages.get(name, {}).get("run_count") for name in ("encode", "denoise")):
-            return "input"
+        # RefMod preview decoding can occur after prompt encoding starts.
+        # The first denoising callback separates conditioning from output decode.
+        if not stages.get("denoise", {}).get("run_count"):
+            return "encode"
     normalized = " ".join(str(raw_phase or "").strip().lower().replace("_", " ").replace("-", " ").split())
     if _task_model_type(task).startswith("index_tts"):
         if normalized.startswith(("preparing vocoder conditioning", "generating waveform")):
@@ -3804,7 +3806,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const authoritativeV13 = Boolean(native && telemetry.execution_task_known === true);
         let structuredId = indexTtsDecode ? "decode" : (authoritativeV13 ? structuredStageId(stablePhase) : null);
         if (structuredId === "decode" && modelType.startsWith("minimax_h3_ref2va") &&
-            authoritativeTimingActiveStage(namespace) === "input") structuredId = "input";
+            authoritativeTimingActiveStage(namespace) === "encode") structuredId = "encode";
         const id = aborting
             ? (namespace.state.currentId || structuredId || stageIdFor(stablePhase))
             : (structuredId || (authoritativeV13 && namespace.state.currentId) || stageIdFor(stablePhase));
