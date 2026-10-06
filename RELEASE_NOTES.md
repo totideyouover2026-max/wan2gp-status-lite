@@ -1,4 +1,8 @@
-# Status Lite 1.2.1
+# Status Lite 1.2.2
+
+Status Lite 1.2.2 keeps H3 RefMod preview decoding in Encode and tracks each additional sample requested with One More, returning to the new sample's live stages after the previous sample's Save.
+
+## Status Lite 1.2.1
 
 Status Lite 1.2.1 fixes live progress across sliding windows. Stage timing now starts fresh when Wan2GP advances to the next window within the same task, so Save from an earlier window cannot hide later Encode or Generate activity.
 

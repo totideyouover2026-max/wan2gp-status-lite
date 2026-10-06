@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2 — 2026-10-06
+
+- Kept MiniMax H3 Ref2VA RefMod preview decoding in Encode until generation begins; output decoding remains in Decode.
+- Restarted live tracking for each sample added with WanGP's One More button, even when the queue task stays the same.
+
 ## 1.2.1 — 2026-09-27
 
 - Restarted stage timing at each sliding-window boundary so Save from one window cannot hide progress in the next.

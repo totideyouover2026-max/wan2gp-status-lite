@@ -1324,7 +1324,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "Status Lite"
-        self.version = "1.2.1"
+        self.version = "1.2.2"
         self.description = (
             "History-free pipeline timeline with stage timings and live ETA estimates."
         )
