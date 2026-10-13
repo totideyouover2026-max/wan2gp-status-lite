@@ -28,9 +28,11 @@ On the final denoising step, the ETA counts down from recent completed step time
 
 IndexTTS speech segment progress appears in Generate. Its vocoder conditioning and waveform generation appear in Decode. When switching from IndexTTS to another model, Prepare shows the outgoing unload followed by the incoming load.
 
+H3 two-phase generation reports the intermediate model handoff and latent upscaling in **Enhance**, followed by **Encode** for phase-two prompt/reference conditioning and **Generate** for the second pass. Latent upscaler progress uses **layers**, separate from denoising steps. Final media decoding uses **Decode**.
+
 ## Minimized or background windows
 
-Browsers can throttle Gradio timers and DOM mutation delivery while minimized. Wan2GP's backend observations continue. When the page becomes visible or focused again, Status Lite immediately refreshes and reconstructs missed performance stages from the backend samples.
+Browsers and Pinokio can throttle page timers while minimized. Status Lite records stage timings and execution start/completion times in WanGP's generation worker independently of page polling. When visible or focused again, it requests a fresh backend snapshot and restores the live/completed stage timings, including a recent task that finished entirely while hidden. Refocusing does not extend the completed-run duration. The backend retains the most recent 16 task executions in memory; Status Lite does not create a browser History ledger. Rendering may pause while hidden, but worker timing collection continues.
 
 ## Downloads
 

@@ -18,7 +18,7 @@ def helpers():
     tree = ast.parse(_source())
     names = {"_StageTimingTelemetry", "_structured_stage_id", "_install_generation_timing_observer",
              "_install_postprocessing_step_observer", "_new_performance_observer", "_observe_postprocessing_progress", "_validated_phase_progress", "_qwen21_decoder_tile_total",
-             "_install_qwen21_tile_observer", "_install_step_observer", "_native_progress_snapshot"}
+             "_install_qwen21_tile_observer", "_install_h3_handoff_observer", "_install_step_observer", "_native_progress_snapshot"}
     definitions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
     constants = [n for n in tree.body if isinstance(n, ast.Assign) and any(
         isinstance(t, ast.Name) and t.id in {"STRUCTURED_STAGE_ORDER", "STRUCTURED_PHASE_STAGE_RULES",

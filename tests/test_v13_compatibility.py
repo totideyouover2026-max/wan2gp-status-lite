@@ -14,7 +14,7 @@ from test_release_smoke import _source, _javascript_with_exports
 
 
 def python_helpers(*names):
-    names = (*names, "_validated_phase_progress")
+    names = (*names, "_validated_phase_progress", "_install_h3_handoff_observer")
     tree = ast.parse(_source())
     definitions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
     scope = {"time": time, "threading": threading, "wraps": wraps}

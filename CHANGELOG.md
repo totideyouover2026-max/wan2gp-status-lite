@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reported H3's transformer handoff before phase-two latent upscaling as Enhance, exposed its layer counts, and recognised native low/high-resolution, tiled and audio-refinement generation statuses.
+
+- Kept worker stage timing, start/completion timestamps and recent completed executions available while a window is minimized; restored missed runs/windows without charging hidden work to Prepare or adding the refocus delay.
+- Requested a fresh backend status snapshot on focus and visibility restoration, and applied completed server timings before finalizing live or History records.
 - Captured task-owned status labels and counters from the same native event, including prompt enhancement and input preprocessing.
 - Prevented denoising counters or invalid tile totals from producing false Decode percentages; repaired Qwen 2.1 tile totals from the actual latent decode dimensions and retained completed counts when a total is unknown.
 - Tracked soundtrack, voice processing and film grain in Enhance, including audio processing after an intermediate Save, and accumulated repeated H3 Encode passes.

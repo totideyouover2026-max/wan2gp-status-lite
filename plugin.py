@@ -209,7 +209,7 @@ STRUCTURED_PHASE_STAGE_RULES = (
               "seedvc", "voice replacement", "replace voice", "mmaudio soundtrack generation",
               "prismaudio soundtrack generation", "audio post processing")),
     ("denoise", ("denoising", "diffusion", "sampling", "generating audio", "generating waveform",
-                 "generating speech", "spectrum smoothing replay", "yue2 score", "yue2 semantic audio",
+                 "generating speech", "audio refinement extra phase", "spectrum smoothing replay", "yue2 score", "yue2 semantic audio",
                  "yue2 acoustic synthesis")),
     ("prepare", ("preparing", "initializing", "loading model", "downloading model", "compiling", "warming up")),
 )
@@ -218,7 +218,10 @@ STRUCTURED_PHASE_STAGE_RULES = (
 def _structured_stage_id(raw_phase):
     import re
     phase = re.sub(r"\s+", " ", re.sub(r"[_-]+", " ", str(raw_phase or "").strip().lower()))
-    phase = re.sub(r"^(?:(?:prompt|sample|sliding window|window|chunk|task|step|phase|pass|video)\s+\d+\s*/\s*\d+\s*,?\s*)+", "", phase).lstrip(" -,:|")
+    phase = re.sub(r"^(?:(?:prompt|sample|sliding window|window|chunk|task|step|pass|video)\s+\d+\s*/\s*\d+\s*,?\s*)+", "", phase).lstrip(" -,:|")
+    if re.match(r"^phase\s+[12]\s*/\s*2\s+(?:low resolution|high resolution|tiled)(?:\s|$)", phase):
+        return "denoise"
+    phase = re.sub(r"^phase\s+\d+\s*/\s*\d+\s*,?\s*", "", phase).lstrip(" -,:|")
     if not phase:
         return None
     if re.search(r"(?:^|\s+-\s+)audio\s+-\s+", str(raw_phase or ""), re.I):
@@ -292,6 +295,12 @@ def _validated_phase_progress(phase, current=None, total=None, unit=None):
     phase = str(phase or "").strip()[:2000]
     current, total = number(current), number(total)
     unit = str(unit or "").strip().lower() or None
+    # H3 reports latent-network layers inside a status-only message.
+    # These are not denoising steps and must not inherit the first pass's total.
+    layer_counter = re.search(r"\bUpscaling H3 latent between phases \((\d+)/(\d+)\)$", phase, re.I)
+    if current is None and layer_counter:
+        current, total = map(float, layer_counter.groups())
+        unit = "layers"
     if current is None or current < 0:
         current = total = None
         unit = None
@@ -325,6 +334,37 @@ def _qwen21_decoder_tile_total(vae, latents):
         return batch * ((height + stride_h - 1) // stride_h) * ((width + stride_w - 1) // stride_w)
     except (AttributeError, TypeError, ValueError, IndexError):
         return None
+
+
+def _install_h3_handoff_observer(pipe, context, stage_timing, gen, task_id, execution_epoch):
+    """Expose H3's silent transformer unload before its phase-two upscaler status."""
+    handoff = {"pass_no": None}
+    if (context is None or stage_timing is None or
+            not type(pipe).__module__.startswith("models.minimax_h3.")):
+        return handoff
+    original = getattr(pipe, "_use_shared_components", None)
+    if not callable(original):
+        return handoff
+    original = getattr(original, "_status_h3_handoff_original", original)
+
+    @wraps(original)
+    def observed(*args, **kwargs):
+        if (getattr(context, "execution", None) == (task_id, execution_epoch) and
+                handoff["pass_no"] == 1 and not gen.get("abort") and not gen.get("early_stop")):
+            timing = stage_timing.snapshot(task_id)
+            if (timing.get("execution_epoch") == execution_epoch and
+                    timing.get("last_stage") in ("denoise", "decode")):
+                label = "Upscaling H3 latent between phases - preparing model handoff"
+                if stage_timing.observe_progress(task_id, execution_epoch, label, stage_id="post"):
+                    # Native checkpoint/read_state callbacks must see the same
+                    # handoff instead of restoring the synthetic Decode label.
+                    gen["progress_phase"] = (label, -1)
+                    handoff["pass_no"] = None
+        return original(*args, **kwargs)
+
+    observed._status_h3_handoff_original = original
+    pipe._use_shared_components = observed
+    return handoff
 
 
 def _install_qwen21_tile_observer(pipe, context):
@@ -367,6 +407,11 @@ class _StageTimingTelemetry:
         self._enhancement_depth = 0
         self._enhancement_progress = None
         self._progress = None
+        self._started_at = None
+        self._started_mono = None
+        self._segment_mono = None
+        self._completed_at = None
+        self._segments = []
 
     @staticmethod
     def _now(now):
@@ -398,6 +443,10 @@ class _StageTimingTelemetry:
             self._retired_task_ids.discard(key)
             self._task_id = key
             self._task_finished = False
+            self._started_at = time.time()
+            self._started_mono = self._segment_mono = now
+            self._completed_at = None
+            self._segments = []
             self._progress = None
             self._enhancement_depth = 0
             self._enhancement_progress = None
@@ -433,6 +482,8 @@ class _StageTimingTelemetry:
             if number <= self._window_no:
                 return False
             self._close_active(now)
+            self._archive_segment(now)
+            self._segment_mono = now
             self._stages = {}
             self._progress = None
             self._last_stage = None
@@ -460,6 +511,8 @@ class _StageTimingTelemetry:
             if number <= self._sample_no:
                 return False
             self._close_active(now)
+            self._archive_segment(now)
+            self._segment_mono = now
             self._stages = {}
             self._progress = None
             self._last_stage = None
@@ -578,10 +631,25 @@ class _StageTimingTelemetry:
         with self._lock:
             if task_id is not None and self._task_id != str(task_id):
                 return
+            if self._task_finished:
+                return
             self._close_active(now, completed=completed)
+            self._completed_at = self._wall_time(now)
+            if not self._task_finished:
+                self._archive_segment(now)
             self._task_finished = True
             self._enhancement_depth = 0
             self._enhancement_progress = None
+
+    def _wall_time(self, now):
+        return self._started_at + max(0.0, now - self._started_mono) if self._started_at is not None else None
+
+    def _archive_segment(self, now):
+        record = self.snapshot(now=now)
+        record.pop("segments", None)
+        record["completed_at"] = self._wall_time(now)
+        self._segments.append(record)
+        self._segments = self._segments[-100:]
 
     def snapshot(self, task_id=None, now=None):
         now = self._now(now)
@@ -601,7 +669,12 @@ class _StageTimingTelemetry:
                     "revision": self._revision,
                     "last_stage": self._last_stage, "stages": stages,
                     "enhancement": dict(self._enhancement_progress) if self._enhancement_progress else None,
-                    "progress": dict(self._progress) if self._progress else None}
+                    "progress": dict(self._progress) if self._progress else None,
+                    "execution_started_at": self._started_at,
+                    "started_at": self._wall_time(self._segment_mono) if self._segment_mono is not None else None,
+                    "completed_at": self._completed_at,
+                    "sample_no": self._sample_no or 1, "window_no": self._window_no or 1,
+                    "segments": list(self._segments)}
 
 
 class _TaskOutcomeTelemetry:
@@ -612,12 +685,13 @@ class _TaskOutcomeTelemetry:
         self._records = []
         self._revision = 0
 
-    def begin(self, task_id, execution_epoch):
+    def begin(self, task_id, execution_epoch, task=None, scope_id=None):
         if task_id is None or execution_epoch is None:
             return
         record = {"task_id": str(task_id), "execution_epoch": int(execution_epoch),
                   "known": False, "success": None, "aborted": False, "error": None,
-                  "output_records": [], "revision": self._revision}
+                  "output_records": [], "revision": self._revision,
+                  "task": task, "scope_id": scope_id, "started_at": time.time()}
         with self._lock:
             self._records = [item for item in self._records
                              if not (item["task_id"] == record["task_id"] and
@@ -625,18 +699,41 @@ class _TaskOutcomeTelemetry:
             self._records.append(record)
             self._records = self._records[-16:]
 
-    def capture_outputs(self, task_id, execution_epoch, output_records):
-        return
+    def capture_outputs(self, task_id, execution_epoch, output_records, sample_no=None, window_no=None):
+        with self._lock:
+            record = self._find(task_id, execution_epoch)
+            if record is None:
+                return
+            by_path = {str(item.get("path") or ""): dict(item) for item in record["output_records"]}
+            for item in output_records or []:
+                if isinstance(item, dict) and item.get("path"):
+                    path = str(item["path"])
+                    output = dict(item)
+                    if path in by_path:
+                        output.update({key: value for key, value in by_path[path].items() if key in ("sample_no", "window_no")})
+                    else:
+                        if sample_no is not None:
+                            output["sample_no"] = sample_no
+                        if window_no is not None:
+                            output["window_no"] = window_no
+                    by_path[path] = output
+            record["output_records"] = list(by_path.values())
+            self._revision += 1
+            record["revision"] = self._revision
 
-    def finish(self, task_id, execution_epoch, success, aborted=False, error=None, output_records=None):
+    def finish(self, task_id, execution_epoch, success, aborted=False, error=None, output_records=None, stage_timing=None, performance=None):
         with self._lock:
             record = self._find(task_id, execution_epoch)
             if record is None:
                 return
             record.update(known=True, success=bool(success), aborted=bool(aborted),
-                          error=str(error)[:500] if error else None, completed_at=time.time())
+                          error=str(error)[:500] if error else None, completed_at=time.time(),
+                          stage_timing=stage_timing, performance=performance)
             self._revision += 1
             record["revision"] = self._revision
+        self.capture_outputs(task_id, execution_epoch, output_records,
+                             sample_no=(stage_timing or {}).get("sample_no"),
+                             window_no=(stage_timing or {}).get("window_no"))
 
     def _find(self, task_id, execution_epoch):
         key = str(task_id)
@@ -644,9 +741,11 @@ class _TaskOutcomeTelemetry:
         return next((item for item in reversed(self._records)
                      if item["task_id"] == key and item["execution_epoch"] == epoch), None)
 
-    def snapshot(self):
+    def snapshot(self, scope_id=None):
+        import copy
         with self._lock:
-            return [dict(item) for item in self._records]
+            return [copy.deepcopy(item) for item in self._records
+                    if scope_id is None or item.get("scope_id") == scope_id]
 
 
 def _recover_polled_stage_timing(stage_timing, task_id, execution_epoch, native_phase, status,
@@ -1590,6 +1689,9 @@ class StatusLitePlugin(WAN2GPPlugin):
             )
             timing_snapshot = stage_timing.snapshot(task_id) if stage_timing is not None else {}
             execution_epoch = timing_snapshot.get("execution_epoch")
+            # WanGP passes the transformer to build_callback, not the H3 pipeline.
+            runtime_model = getattr(original_builder, "__globals__", {}).get("wan_model", pipe)
+            handoff = _install_h3_handoff_observer(runtime_model, context, stage_timing, gen, task_id, execution_epoch)
             observer_id = f"{time.time_ns()}"
             performance = _new_performance_observer(task_id)
             performance["id"] = observer_id
@@ -1625,6 +1727,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                         segment_number = 0
                     gen["progress_phase"] = ("Generating speech", segment_number)
                 progress_title = callback_kwargs.get("progress_title", callback_args[10] if len(callback_args) > 10 else None)
+                read_state = callback_kwargs.get("read_state", callback_args[3] if len(callback_args) > 3 else False)
+                pass_no = callback_kwargs.get("pass_no", callback_args[5] if len(callback_args) > 5 else -1)
+                if not read_state and progress_title is None:
+                    handoff["pass_no"] = pass_no
                 normalized_unit = str(progress_unit or "").strip().lower()
                 # Named phases and non-step counters are phase-local, not denoising performance.
                 if progress_title is not None or (normalized_unit and normalized_unit not in ("step", "steps")):
@@ -1685,7 +1791,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                         "phase": phase_index,
                         "step": step_idx + 1,
                         "total_steps": current_total,
-                        "pass_no": _telemetry_value(callback_kwargs.get("pass_no", -1)),
+                        "pass_no": _telemetry_value(pass_no),
                         "duration_seconds": round(max(0.0, now - last_step_at), 4),
                         "skip_method": _telemetry_value(getattr(cache, "cache_type", None)),
                         "skipped": bool(skip_delta) if skip_delta is not None else None,
@@ -1746,9 +1852,23 @@ class StatusLitePlugin(WAN2GPPlugin):
             self._active_task_id = task_id
             execution_epoch = self._stage_timing.start_task(task_id, new_execution=True)
             task_outcomes = getattr(self, "_task_outcomes", None)
-            if task_outcomes is not None:
-                task_outcomes.begin(task_id, execution_epoch)
             state = kwargs.get("state")
+            state_gen = state.get("gen") if isinstance(state, dict) and isinstance(state.get("gen"), dict) else state
+            if task_outcomes is not None:
+                reader = globals().get("_task_telemetry")
+                task_snapshot = reader(task, get_model_name=getattr(self, "get_model_name", None),
+                                       get_model_family=getattr(self, "get_model_family", None),
+                                       families_infos=getattr(self, "families_infos", None)) if callable(reader) else None
+                task_outcomes.begin(task_id, execution_epoch, task=task_snapshot, scope_id=id(state_gen))
+            output_reader = globals().get("_generation_output_records")
+            initial_paths = {record["path"] for record in output_reader(state)} if callable(output_reader) else set()
+
+            def task_outputs():
+                if not callable(output_reader):
+                    return []
+                return [record for record in output_reader(state)
+                        if record.get("path") not in initial_paths]
+
             call_args = list(args)
             send_cmd = kwargs.get("send_cmd")
             send_in_args = send_cmd is None and call_args and callable(call_args[0])
@@ -1777,6 +1897,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                             task_id, execution_epoch, phase, current, total, unit,
                             stage_id=_task_owned_stage_id(task, phase, self._stage_timing),
                         )
+                    if command == "output" and task_outcomes is not None:
+                        task_outcomes.capture_outputs(task_id, execution_epoch, task_outputs(),
+                                                      sample_no=state_gen.get("repeat_no", 1),
+                                                      window_no=state_gen.get("window_no", 1))
                     return send_cmd(command, data, *send_args, **send_kwargs)
                 if send_in_args:
                     call_args[0] = observed_send_cmd
@@ -1801,7 +1925,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                 state_gen = state.get("gen") if isinstance(state, dict) and isinstance(state.get("gen"), dict) else {}
                 if task_outcomes is not None:
                     task_outcomes.finish(
-                        task_id, execution_epoch, bool(result), aborted=bool(state_gen.get("abort")), error=error,
+                        task_id, execution_epoch, bool(result), aborted=bool(state_gen.get("abort")),
+                        error=error, output_records=task_outputs(),
+                        stage_timing=self._stage_timing.snapshot(task_id),
+                        performance=_latest_performance_snapshot(state_gen, getattr(self, "_latest_performance", None)),
                     )
 
         observed._status_lite_generation_timing_observer = True
@@ -2023,7 +2150,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 "performance": _latest_performance_snapshot(gen, self._latest_performance),
                 "model_lifecycle": MODEL_LIFECYCLE_TELEMETRY.snapshot(),
                 "stage_timing": stage_timing,
-                "task_outcomes": self._task_outcomes.snapshot(),
+                "task_outcomes": self._task_outcomes.snapshot(scope_id=id(gen)),
                 "planned_stages": planned_stages if plan_matches_timing else [],
                 "planned_stage_task_id": stage_timing.get("task_id") if plan_matches_timing else None,
                 "planned_stage_execution_epoch": stage_timing.get("execution_epoch") if plan_matches_timing else None,
@@ -2100,6 +2227,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                     trigger_mode="always_last",
                 )
                 if state_component is not None:
+                    run_refresh = gr.Button(value="Refresh status", visible=False, elem_id="status-lite-run-refresh")
+                    run_refresh.click(fn=self._run_snapshot_json, inputs=[state_component], outputs=[run_bridge],
+                                      queue=False, show_progress="hidden", api_name=False, show_api=False)
                     run_timer = gr.Timer(value=0.5, active=True)
                     run_timer.tick(
                         fn=self._run_snapshot_json,
@@ -2189,6 +2319,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         return r"""
 (function () {
     const NAMESPACE = "__wangpStatusLite";
+    const BACKGROUND_CAPTURE_STARTED_AT = Date.now() / 1000;
     const COLLAPSED_KEY = "wangp.status-lite.collapsed.v1";
     const MAX_STEP_RECORDS = 300;
     const TICK_MS = 250;
@@ -3071,14 +3202,16 @@ class StatusLitePlugin(WAN2GPPlugin):
             "seedvc", "voice replacement", "replace voice", "mmaudio soundtrack generation",
             "prismaudio soundtrack generation", "audio post processing"]],
         ["denoise", ["denoising", "diffusion", "sampling", "generating audio", "generating waveform",
-            "generating speech", "spectrum smoothing replay", "yue2 score", "yue2 semantic audio", "yue2 acoustic synthesis"]],
+            "generating speech", "audio refinement extra phase", "spectrum smoothing replay", "yue2 score", "yue2 semantic audio", "yue2 acoustic synthesis"]],
         ["prepare", ["preparing", "initializing", "loading model", "downloading model", "compiling", "warming up"]]
     ];
 
     function structuredStageId(rawPhase) {
         let phase = String(rawPhase || "").trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
         if (!phase) return null;
-        phase = phase.replace(/^(?:(?:prompt|sample|sliding window|window|chunk|task|step|phase|pass|video)\s+\d+\s*\/\s*\d+\s*,?\s*)+/, "").replace(/^[ \-,:|]+/, "");
+        phase = phase.replace(/^(?:(?:prompt|sample|sliding window|window|chunk|task|step|pass|video)\s+\d+\s*\/\s*\d+\s*,?\s*)+/, "").replace(/^[ \-,:|]+/, "");
+        if (/^phase\s+[12]\s*\/\s*2\s+(?:low resolution|high resolution|tiled)(?:\s|$)/.test(phase)) return "denoise";
+        phase = phase.replace(/^phase\s+\d+\s*\/\s*\d+\s*,?\s*/, "").replace(/^[ \-,:|]+/, "");
         if (/(?:^|\s+-\s+)audio\s+-\s+/i.test(String(rawPhase || ""))) return "post";
         if (phase.includes("yue2 audio decoding")) return "decode";
         for (const [stageId, phrases] of STRUCTURED_PHASE_STAGE_RULES) {
@@ -3111,11 +3244,12 @@ class StatusLitePlugin(WAN2GPPlugin):
             .replace(/^(?:(?:prompt|sample|sliding window)\s+\d+\s*\/\s*\d+\s*,?\s*)+/i, "")
             .replace(/^\s*-\s*/, "")
             .trim() || "Preparing";
-        const kind = stageIdFor(label);
+        const kind = structuredStageId(label) || stageIdFor(label);
         const phaseMatch = label.match(/\bdenoising\s+(first|second|third|\d+(?:st|nd|rd|th)?)\s+phase\b/i);
+        const nativePhaseMatch = kind === "denoise" && label.match(/\bphase\s+(\d+)\s*\/\s*\d+\b/i);
         const phaseNumber = phaseMatch
             ? ({ first: 1, second: 2, third: 3 }[phaseMatch[1].toLowerCase()] || Number.parseInt(phaseMatch[1], 10))
-            : null;
+            : (nativePhaseMatch ? Number.parseInt(nativePhaseMatch[1], 10) : null);
         const key = label.toLowerCase()
             .replace(/[^a-z0-9]+/g, "-")
             .replace(/^-+|-+$/g, "") || kind;
@@ -3764,7 +3898,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         resetJob(namespace);
         namespace.completedStateUntil = 0;
         const observedNow = Number(telemetry && telemetry.server_time) * 1000 || Date.now();
-        const now = Number.isFinite(options.startedAt) ? options.startedAt : observedNow;
+        const ownedStart = stageTimingForRun({queue_task_id: task && task.id,
+            sample_no: options.sampleNo || sampleNumber(telemetry) || 1,
+            window_no: options.windowNo || windowDetails(telemetry).number || 1}, telemetry);
+        const workerStartedAt = optionalNumber(ownedStart && ownedStart.started_at);
+        const now = Number.isFinite(options.startedAt) ? options.startedAt :
+            (Number.isFinite(workerStartedAt) ? workerStartedAt * 1000 : observedNow);
         const settings = cloneJson(task && task.settings, {});
         normalizeRunSettings(settings);
         const initialStageTiming = telemetry && telemetry.stage_timing;
@@ -3836,6 +3975,7 @@ class StatusLitePlugin(WAN2GPPlugin):
     function finishRun(namespace, status, completedAt, telemetry, outputEnd) {
         const run = namespace.activeRun;
         if (!run) return;
+        applyServerStageTiming(namespace, telemetry || namespace.runTelemetry);
         const finishedStageId = namespace.state.currentId;
         const finishedEpoch = optionalNumber(run._stageTimingEpoch);
         const finishedExecutionKey = Number.isFinite(finishedEpoch) && run.queue_task_id !== null && run.queue_task_id !== undefined
@@ -3845,7 +3985,10 @@ class StatusLitePlugin(WAN2GPPlugin):
         recoverMissedPerformanceStages(namespace);
         finishStage(namespace.state, namespace.state.currentId);
         finishPhase(namespace.state);
-        const ended = Number.isFinite(completedAt) ? completedAt : Date.now();
+        const runTiming = stageTimingForRun(run, telemetry || namespace.runTelemetry);
+        const workerCompletedAt = optionalNumber(runTiming && runTiming.completed_at);
+        const ended = Number.isFinite(workerCompletedAt) ? workerCompletedAt * 1000 :
+            (Number.isFinite(completedAt) ? completedAt : Date.now());
         namespace.state.overallElapsed = Math.max(0, (ended - run.started_at) / 1000);
         namespace.lastCompletedAt = ended;
         namespace.activeRun = null;
@@ -3872,9 +4015,59 @@ class StatusLitePlugin(WAN2GPPlugin):
         return Number.isFinite(number) && number > 0 ? Math.floor(number) : null;
     }
 
+    function recoverBackgroundExecutions(namespace, telemetry) {
+        const outcomes = (Array.isArray(telemetry && telemetry.task_outcomes) ? telemetry.task_outcomes : [])
+            .filter(item => item && item.known === true && item.task && item.stage_timing &&
+                Number(item.completed_at) >= BACKGROUND_CAPTURE_STARTED_AT)
+            .sort((a, b) => Number(a.started_at) - Number(b.started_at));
+        namespace.recoveredExecutionKeys = namespace.recoveredExecutionKeys || new Set();
+        for (const outcome of outcomes) {
+            const key = `${outcome.task_id}:${outcome.execution_epoch}`;
+            const active = namespace.activeRun;
+            if (namespace.recoveredExecutionKeys.has(key)) continue;
+            if (active && String(active.queue_task_id) === String(outcome.task_id) &&
+                active._stageTimingEpoch === optionalNumber(outcome.execution_epoch)) continue;
+            if (active) continue; // Complete the observed execution before replaying others.
+            if (namespace.completedExecutionKey === key) {
+                namespace.recoveredExecutionKeys.add(key);
+                continue;
+            }
+            const segments = Array.isArray(outcome.stage_timing.segments) && outcome.stage_timing.segments.length
+                ? outcome.stage_timing.segments : [outcome.stage_timing];
+            for (let index = 0; index < segments.length; index++) {
+                const segment = segments[index];
+                const outputs = (outcome.output_records || []).filter(output =>
+                    (optionalNumber(output.sample_no) || 1) === (optionalNumber(segment.sample_no) || 1) &&
+                    (optionalNumber(output.window_no) || 1) === (optionalNumber(segment.window_no) || 1));
+                const replay = {...telemetry, status: segment.progress && segment.progress.phase || "Saved",
+                    stage_timing: segment, executing_task: outcome.task,
+                    active_task: outcome.task, sample_no: segment.sample_no, window_no: segment.window_no,
+                    total_windows: Math.max(...segments.filter(item => item.sample_no === segment.sample_no).map(item => Number(item.window_no) || 1)),
+                    sliding_window: segments.some(item => Number(item.window_no) > 1),
+                    output_records: outputs, performance: outcome.performance ? {...outcome.performance,
+                        steps: (outcome.performance.steps || []).filter(step => Number(step.completed_at) >= Number(segment.started_at) &&
+                            Number(step.completed_at) <= Number(segment.completed_at || outcome.completed_at))} : null,
+                    planned_stages: outcome.task.planned_stages || [], planned_stage_task_id: outcome.task_id,
+                    planned_stage_execution_epoch: outcome.execution_epoch,
+                    task_outcomes: [{...outcome, stage_timing: segment, output_records: outputs}]};
+                startRun(namespace, outcome.task, replay, {startedAt: Number(segment.started_at) * 1000,
+                    outputBaseline: 0, sampleNo: segment.sample_no, windowNo: replay.sliding_window ? segment.window_no : null,
+                    totalWindows: replay.total_windows});
+                applyServerStageTiming(namespace, replay);
+                finishRun(namespace, index < segments.length - 1 ? "window" : (outcome.aborted ? "aborted" : (outcome.success ? "completed" : "failed")),
+                    Number(segment.completed_at || outcome.completed_at) * 1000, replay);
+            }
+            namespace.recoveredExecutionKeys.add(key);
+        }
+        // The backend retains 16 executions, so this guard need not grow indefinitely.
+        const available = new Set(outcomes.map(item => `${item.task_id}:${item.execution_epoch}`));
+        namespace.recoveredExecutionKeys = new Set([...namespace.recoveredExecutionKeys].filter(key => available.has(key)));
+    }
+
     function syncRunTelemetry(namespace) {
         const telemetry = readRunSnapshot(namespace);
         if (!telemetry || telemetry.error || typeof telemetry.in_progress !== "boolean") return;
+        recoverBackgroundExecutions(namespace, telemetry);
         const authoritative = telemetry.execution_task_known === true;
         const taskSource = authoritative ? telemetry.executing_task : telemetry.active_task;
         const task = taskSource && typeof taskSource === "object" ? taskSource : null;
@@ -4472,8 +4665,21 @@ class StatusLitePlugin(WAN2GPPlugin):
         return Number.isFinite(record.elapsed) ? record.elapsed : null;
     }
 
+    function stageTimingForRun(run, telemetry) {
+        if (!run) return null;
+        const outcome = taskOutcomeForRun(run, telemetry);
+        let timing = outcome && outcome.stage_timing || (telemetry && telemetry.stage_timing);
+        if (!timing || String(timing.task_id) !== String(run.queue_task_id) ||
+            (Number.isFinite(run._stageTimingEpoch) && optionalNumber(timing.execution_epoch) !== run._stageTimingEpoch)) return null;
+        const sample = optionalNumber(run.sample_no) || 1;
+        const window = optionalNumber(run.window_no) || 1;
+        const segment = (Array.isArray(timing.segments) ? timing.segments : []).find(item =>
+            (optionalNumber(item.sample_no) || 1) === sample && (optionalNumber(item.window_no) || 1) === window);
+        return segment || timing;
+    }
+
     function applyServerStageTiming(namespace, telemetry) {
-        const timing = telemetry && telemetry.stage_timing;
+        const timing = stageTimingForRun(namespace && namespace.activeRun, telemetry);
         const stages = timing && timing.stages;
         const activeRun = namespace && namespace.activeRun;
         const timingEpoch = optionalNumber(timing && timing.execution_epoch);
@@ -5727,6 +5933,9 @@ class StatusLitePlugin(WAN2GPPlugin):
         renderIdle(namespace);
         namespace.resumeHandler = () => {
             if (document.hidden) return;
+            const refresh = namespace.container.querySelector("#status-lite-run-refresh");
+            const refreshButton = refresh && (refresh.matches("button") ? refresh : refresh.querySelector("button"));
+            if (refreshButton) refreshButton.click();
             tick(namespace);
             // Gradio's browser-driven Timer may publish its first refreshed
             // backend bridge value shortly after the page becomes visible.
