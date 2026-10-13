@@ -122,7 +122,7 @@ class LiteReleaseSmokeTests(unittest.TestCase):
         self.assertNotIn("splitMissedSlidingWindows", javascript)
         stage_classifier = javascript[javascript.index("function stageIdFor"):javascript.index("function phaseInfo")]
         self.assertIn("distilled refinement", stage_classifier)
-        self.assertIn('const resumableStage = ["input", "post"].includes(snapshot.id)', javascript)
+        self.assertIn('const resumableStage = ["input", "encode", "post", "save"].includes(snapshot.id)', javascript)
 
     def test_status_pro_takes_precedence_without_duplicate_observers(self):
         source = _source()

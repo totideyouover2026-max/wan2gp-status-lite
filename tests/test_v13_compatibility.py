@@ -14,6 +14,7 @@ from test_release_smoke import _source, _javascript_with_exports
 
 
 def python_helpers(*names):
+    names = (*names, "_validated_phase_progress")
     tree = ast.parse(_source())
     definitions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
     scope = {"time": time, "threading": threading, "wraps": wraps}
@@ -254,7 +255,7 @@ class V13CompatibilityTests(unittest.TestCase):
             self.assertEqual(normalize(stale_encode),
                              {"phase": "Denoising", "current": current, "total": 8,
                               "unit": "steps", "progress": current / 8 * 100})
-        self.assertEqual(normalize({"progress_phase": ["VAE Decoding", 13], "phase_progress_units": [12, "tiles"]})["progress"], 100)
+        self.assertIsNone(normalize({"progress_phase": ["VAE Decoding", 13], "phase_progress_units": [12, "tiles"]})["progress"])
         self.assertIn('"native_progress": _native_progress_snapshot(gen)', _source())
 
     def test_callback_layer_tile_progress_never_changes_denoising_observer(self):

@@ -1,4 +1,6 @@
 import builtins
+import inspect
+import importlib
 import json
 import os
 import threading
@@ -194,13 +196,18 @@ STRUCTURED_STAGE_ORDER = ("prepare", "input", "encode", "denoise", "decode", "po
 STRUCTURED_PHASE_STAGE_RULES = (
     ("save", ("saving", "saved", "save output", "exporting", "writing output", "muxing", "remuxing", "finalizing")),
     ("input", ("encoding hum carrier", "vae encoding", "vae encode", "input preprocessing", "preparing input", "preparing control",
-               "loading control", "extracting pose", "extracting depth", "removing reference background")),
+               "loading control", "extracting pose", "extracting depth", "extracting face movements", "preprocessing video",
+               "removing images references background", "removing reference background", "encoding h3 control video", "encoding h3 known frames")),
     ("encode", ("encoding prompt", "encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
-                "conditioning", "building embeddings", "text features")),
-    ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "reconstructing")),
-    ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial refinement",
+                "conditioning", "building embeddings", "text features", "enhancing prompt", "captioning images",
+                "encoding image", "encoding reference image", "encoding h3 prompt", "encoding h3 phase 2 prompt",
+                "preparing image conditioning", "preparing image and video conditioning")),
+    ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding h3 stereo audio", "reconstructing")),
+    ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling",
+              "temporal upsampling", "dlss", "adding film grain", "applying media post processing", "spatial refinement",
               "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
-              "seedvc", "voice replacement", "audio post processing")),
+              "seedvc", "voice replacement", "replace voice", "mmaudio soundtrack generation",
+              "prismaudio soundtrack generation", "audio post processing")),
     ("denoise", ("denoising", "diffusion", "sampling", "generating audio", "generating waveform",
                  "generating speech", "spectrum smoothing replay", "yue2 score", "yue2 semantic audio",
                  "yue2 acoustic synthesis")),
@@ -214,6 +221,8 @@ def _structured_stage_id(raw_phase):
     phase = re.sub(r"^(?:(?:prompt|sample|sliding window|window|chunk|task|step|phase|pass|video)\s+\d+\s*/\s*\d+\s*,?\s*)+", "", phase).lstrip(" -,:|")
     if not phase:
         return None
+    if re.search(r"(?:^|\s+-\s+)audio\s+-\s+", str(raw_phase or ""), re.I):
+        return "post"
     if "yue2 audio decoding" in phase:
         return "decode"
     for stage_id, phrases in STRUCTURED_PHASE_STAGE_RULES:
@@ -266,6 +275,79 @@ def _task_owned_stage_id(task, raw_phase, stage_timing=None):
     return stage_id
 
 
+def _validated_phase_progress(phase, current=None, total=None, unit=None):
+    """Validate one atomic phase event; preserve completed units when its total is unknown."""
+    import math
+    import re
+
+    def number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    phase = str(phase or "").strip()[:2000]
+    current, total = number(current), number(total)
+    unit = str(unit or "").strip().lower() or None
+    if current is None or current < 0:
+        current = total = None
+        unit = None
+    elif re.search(r"\bdecod\w*", phase, re.I) and unit not in ("tile", "tiles", "frame", "frames", "chunk", "chunks", "sample", "samples", "segment", "segments"):
+        # build_callback renames the last denoising step to VAE Decoding.
+        # Only decoder-specific units are evidence of actual decoder progress.
+        current = total = None
+        unit = None
+    elif total is None or total <= 0 or current > total:
+        total = None
+    return {"phase": phase, "current": current, "total": total, "unit": unit,
+            "progress": current / total * 100 if current is not None and total is not None else None}
+
+
+def _qwen21_decoder_tile_total(vae, latents):
+    """Count the exact Qwen 2.1 CPU decode loop from its latent shape and effective strides."""
+    try:
+        latent = latents[-1] if isinstance(latents, list) else latents
+        batch, _, frames, height, width = map(int, latent.shape)
+        scale = int(vae.spatial_compression_ratio)
+        if min(batch, height, width, scale) <= 0 or frames != 1:
+            return None
+        tiled = vae.use_tiling and (height * scale > vae.tile_sample_min_height or
+                                   width * scale > vae.tile_sample_min_width)
+        if not tiled:
+            return batch
+        stride_h = int(vae.tile_sample_stride_height) // scale
+        stride_w = int(vae.tile_sample_stride_width) // scale
+        if min(stride_h, stride_w) <= 0:
+            return None
+        return batch * ((height + stride_h - 1) // stride_h) * ((width + stride_w - 1) // stride_w)
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _install_qwen21_tile_observer(pipe, context):
+    vae = getattr(pipe, "vae", None)
+    if vae is None or type(vae).__name__ != "AutoencoderKLQwenImage21":
+        return
+    original = getattr(vae, "decode_to_cpu_uint8", None)
+    if not callable(original) or getattr(original, "_status_pro_tile_observer", False):
+        return
+
+    @wraps(original)
+    def observed(latents, *args, **kwargs):
+        previous = getattr(context, "decoder_tile_total", None)
+        context.decoder_tile_total = _qwen21_decoder_tile_total(vae, latents)
+        try:
+            return original(latents, *args, **kwargs)
+        finally:
+            context.decoder_tile_total = previous
+
+    observed._status_pro_tile_observer = True
+    vae.decode_to_cpu_uint8 = observed
+
+
 class _StageTimingTelemetry:
     """Task-scoped stage durations measured only in the server monotonic domain."""
 
@@ -282,6 +364,9 @@ class _StageTimingTelemetry:
         self._window_no = None
         self._sample_no = None
         self._retired_task_ids = set()
+        self._enhancement_depth = 0
+        self._enhancement_progress = None
+        self._progress = None
 
     @staticmethod
     def _now(now):
@@ -313,6 +398,9 @@ class _StageTimingTelemetry:
             self._retired_task_ids.discard(key)
             self._task_id = key
             self._task_finished = False
+            self._progress = None
+            self._enhancement_depth = 0
+            self._enhancement_progress = None
             self._stages = {}
             self._active_stage = None
             self._active_since = None
@@ -346,6 +434,7 @@ class _StageTimingTelemetry:
                 return False
             self._close_active(now)
             self._stages = {}
+            self._progress = None
             self._last_stage = None
             self._window_no = number
             self._revision += 1
@@ -372,6 +461,7 @@ class _StageTimingTelemetry:
                 return False
             self._close_active(now)
             self._stages = {}
+            self._progress = None
             self._last_stage = None
             self._window_no = None
             self._sample_no = number
@@ -392,10 +482,15 @@ class _StageTimingTelemetry:
             return True
         if stage_id == "input" and self._active_stage in ("encode", "post"):
             return True
+        if stage_id == "encode" and self._active_stage in ("denoise", "decode", "post"):
+            return True
         return False
 
-    def _observe_stage_locked(self, stage_id, now):
-        if stage_id not in STRUCTURED_STAGE_ORDER or not self._transition_allowed(stage_id):
+    def _observe_stage_locked(self, stage_id, now, processor_entry=False):
+        # Processor-internal encoding, sampling and decoding all belong to Enhance.
+        if self._enhancement_depth and stage_id in STRUCTURED_STAGE_ORDER:
+            stage_id = "post"
+        if stage_id not in STRUCTURED_STAGE_ORDER or (not processor_entry and not self._transition_allowed(stage_id)):
             return False
         if self._active_stage == stage_id:
             return True
@@ -429,6 +524,55 @@ class _StageTimingTelemetry:
             task_id, _structured_stage_id(raw_phase), now, execution_epoch=execution_epoch
         )
 
+    def observe_progress(self, task_id, execution_epoch, phase, current=None, total=None, unit=None, stage_id=None):
+        with self._lock:
+            if (task_id is None or self._task_id != str(task_id) or
+                    self._execution_epoch != execution_epoch or self._task_finished):
+                return False
+            if not self._observe_stage_locked(stage_id, self._now(None)):
+                return False
+            progress = _validated_phase_progress(phase, current, total, unit)
+            progress["stage"] = self._active_stage
+            self._progress = progress
+            if self._enhancement_depth:
+                self._enhancement_progress = dict(progress)
+            self._revision += 1
+            return True
+
+    def begin_enhancement(self, task_id, execution_epoch, label="Upsampling"):
+        with self._lock:
+            if (task_id is None or self._task_id != str(task_id) or
+                    self._execution_epoch != execution_epoch or self._task_finished):
+                return False
+            if not self._observe_stage_locked("post", self._now(None), processor_entry=True):
+                return False
+            if not self._enhancement_depth:
+                # Do not inherit the generation VAE's stale counter on entry.
+                self._enhancement_progress = _validated_phase_progress(label)
+                self._enhancement_progress["stage"] = "post"
+                self._progress = dict(self._enhancement_progress)
+            self._enhancement_depth += 1
+            self._revision += 1
+            return True
+
+    def observe_enhancement_progress(self, task_id, execution_epoch, phase, current=None, total=None, unit=None):
+        with self._lock:
+            if (self._task_id != str(task_id) or self._execution_epoch != execution_epoch or
+                    not self._enhancement_depth):
+                return
+            self._enhancement_progress = _validated_phase_progress(phase or "Upsampling", current, total, unit)
+            self._enhancement_progress["stage"] = "post"
+            self._progress = dict(self._enhancement_progress)
+            self._revision += 1
+
+    def end_enhancement(self, task_id, execution_epoch):
+        with self._lock:
+            if self._task_id == str(task_id) and self._execution_epoch == execution_epoch:
+                self._enhancement_depth = max(0, self._enhancement_depth - 1)
+                if not self._enhancement_depth:
+                    self._enhancement_progress = None
+                self._revision += 1
+
     def finish_task(self, task_id=None, now=None, completed=False):
         now = self._now(now)
         with self._lock:
@@ -436,6 +580,8 @@ class _StageTimingTelemetry:
                 return
             self._close_active(now, completed=completed)
             self._task_finished = True
+            self._enhancement_depth = 0
+            self._enhancement_progress = None
 
     def snapshot(self, task_id=None, now=None):
         now = self._now(now)
@@ -453,7 +599,9 @@ class _StageTimingTelemetry:
                 }
             return {"task_id": self._task_id, "execution_epoch": self._execution_epoch,
                     "revision": self._revision,
-                    "last_stage": self._last_stage, "stages": stages}
+                    "last_stage": self._last_stage, "stages": stages,
+                    "enhancement": dict(self._enhancement_progress) if self._enhancement_progress else None,
+                    "progress": dict(self._progress) if self._progress else None}
 
 
 class _TaskOutcomeTelemetry:
@@ -561,8 +709,11 @@ def _native_progress_snapshot(gen):
     amount = args[0] if args and isinstance(args[0], (list, tuple)) else ()
     units = gen.get("phase_progress_units")
     units = units if isinstance(units, (list, tuple)) else ()
-    total = number(amount[1]) if len(amount) > 1 else None
-    unit = args[3] if len(args) > 3 and isinstance(args[3], str) else None
+    args_label = str(args[1] or "") if len(args) > 1 else ""
+    coherent = bool(amount and number(amount[0]) == current and
+                    (not args_label or phase.lower() in args_label.lower()))
+    total = number(amount[1]) if coherent and len(amount) > 1 else None
+    unit = args[3] if coherent and len(args) > 3 and isinstance(args[3], str) else None
     if total is None or total <= 0:
         total = number(units[0]) if units else None
         unit = units[1] if len(units) > 1 and isinstance(units[1], str) else None
@@ -572,9 +723,7 @@ def _native_progress_snapshot(gen):
     if is_denoising and (total is None or total <= 0 or (unit and unit.lower() not in ("step", "steps"))):
         total = number(gen.get("num_inference_steps"))
         unit = "steps"
-    if total is not None and total > 0:
-        result.update(total=total, unit=unit or None, progress=max(0.0, min(100.0, current / total * 100)))
-    return result
+    return _validated_phase_progress(phase, current, total, unit)
 
 
 def _memory_snapshot(torch_module=None):
@@ -672,14 +821,15 @@ def _new_performance_observer(task_id=None):
 
 def _observe_postprocessing_progress(performance, progress_callback, torch_module=None):
     """Capture registered postprocessor progress callbacks without inventing steps."""
-    def observed(phase, current_step=None, total_steps=None):
+    def observed(phase, current_step=None, total_steps=None, unit=None):
         try:
             current = int(current_step) if current_step is not None else None
             total = int(total_steps) if total_steps is not None else None
         except (TypeError, ValueError):
             current = total = None
         label = str(phase or "").strip()[:300]
-        if current is not None and total is not None and current > 0 and total > 0:
+        if (current is not None and total is not None and current > 0 and total > 0 and
+                (unit is None or str(unit).lower() in ("step", "steps"))):
             previous_step = performance.get("_last_step")
             previous_label = str(performance.get("_phase_label") or "")
             if label != previous_label or (previous_step is not None and current <= previous_step):
@@ -711,6 +861,8 @@ def _observe_postprocessing_progress(performance, progress_callback, torch_modul
                     performance["steps_truncated"] = True
                 performance["_last_step_at"] = now
                 performance["_last_step"] = current
+        if unit is not None:
+            return progress_callback(phase, current_step, total_steps, unit)
         return progress_callback(phase, current_step, total_steps)
 
     return observed
@@ -1361,6 +1513,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         self.request_global("build_callback")
         self.request_global("generate_media")
         self.request_global("perform_spatial_upsampling")
+        self.request_global("perform_temporal_upsampling")
         self.request_global("release_model")
         self.request_global("torch")
         self.add_custom_js(self._javascript())
@@ -1421,6 +1574,9 @@ class StatusLitePlugin(WAN2GPPlugin):
 
         @wraps(original_builder)
         def observed_builder(state, pipe, *args, **kwargs):
+            context = getattr(self, "_generation_context", None)
+            if context is not None:
+                _install_qwen21_tile_observer(pipe, context)
             callback = original_builder(state, pipe, *args, **kwargs)
             state = state if isinstance(state, dict) else {}
             gen = state.get("gen") if isinstance(state.get("gen"), dict) else {}
@@ -1582,6 +1738,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             self._generation_timing_observer_installed = True
             return
 
+        self._generation_context = threading.local()
+
         @wraps(original)
         def observed(task, *args, **kwargs):
             task_id = task.get("id") if isinstance(task, dict) else None
@@ -1606,8 +1764,18 @@ class StatusLitePlugin(WAN2GPPlugin):
                     if command == "progress" and isinstance(data, (list, tuple)) and len(data) > 1:
                         phase = data[1]
                     if command in ("status", "progress"):
-                        self._stage_timing.observe_stage(
-                            task_id, _task_owned_stage_id(task, phase, self._stage_timing), execution_epoch=execution_epoch
+                        current = total = unit = None
+                        if command == "progress" and isinstance(data, (list, tuple)):
+                            amount = data[0] if data and isinstance(data[0], (list, tuple)) else ()
+                            current = amount[0] if amount else None
+                            total = amount[1] if len(amount) > 1 else None
+                            unit = data[3] if len(data) > 3 else None
+                            decoder_total = getattr(self._generation_context, "decoder_tile_total", None)
+                            if str(unit or "").lower() == "tiles" and decoder_total is not None:
+                                total = decoder_total
+                        self._stage_timing.observe_progress(
+                            task_id, execution_epoch, phase, current, total, unit,
+                            stage_id=_task_owned_stage_id(task, phase, self._stage_timing),
                         )
                     return send_cmd(command, data, *send_args, **send_kwargs)
                 if send_in_args:
@@ -1616,6 +1784,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                     kwargs["send_cmd"] = observed_send_cmd
             result = False
             error = None
+            previous_execution = getattr(self._generation_context, "execution", None)
+            previous_decoder_total = getattr(self._generation_context, "decoder_tile_total", None)
+            self._generation_context.decoder_tile_total = None
+            self._generation_context.execution = (task_id, execution_epoch)
             try:
                 result = original(task, *call_args, **kwargs)
                 return result
@@ -1623,6 +1795,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                 error = exc
                 raise
             finally:
+                self._generation_context.execution = previous_execution
+                self._generation_context.decoder_tile_total = previous_decoder_total
                 self._stage_timing.finish_task(task_id, completed=bool(result))
                 state_gen = state.get("gen") if isinstance(state, dict) and isinstance(state.get("gen"), dict) else {}
                 if task_outcomes is not None:
@@ -1638,41 +1812,98 @@ class StatusLitePlugin(WAN2GPPlugin):
     def _install_postprocessing_step_observer(self):
         if self._postprocessing_step_observer_installed:
             return
-        original = getattr(self, "perform_spatial_upsampling", None)
-        if not callable(original):
-            return
-        if getattr(original, "_status_lite_postprocessing_step_observer", False):
-            self._postprocessing_step_observer_installed = True
-            return
         torch_module = getattr(self, "torch", None)
 
-        @wraps(original)
-        def observed(*args, **kwargs):
-            spatial_upsampling = kwargs.get(
-                "spatial_upsampling",
-                args[1] if len(args) > 1 else "",
-            )
-            progress_callback = kwargs.get("progress_callback")
-            lowered = str(spatial_upsampling or "").strip().lower()
-            if callable(progress_callback) and lowered.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)):
-                timing_identity = self._stage_timing.snapshot(self._active_task_id)
-                self._stage_timing.observe_stage(
-                    self._active_task_id, "post",
-                    execution_epoch=timing_identity.get("execution_epoch"),
-                )
-                performance = _new_performance_observer(self._active_task_id)
-                self._latest_performance = performance
-                kwargs["progress_callback"] = _observe_postprocessing_progress(
-                    performance,
-                    progress_callback,
-                    torch_module,
-                )
-            return original(*args, **kwargs)
+        def wrap_processor(original, name, label):
+            signature = inspect.signature(original)
+            extra_key = next((key for key, value in signature.parameters.items()
+                              if value.kind == inspect.Parameter.VAR_KEYWORD), None)
 
-        observed._status_lite_postprocessing_step_observer = True
-        self.set_global("perform_spatial_upsampling", observed)
-        self.perform_spatial_upsampling = observed
-        self._postprocessing_step_observer_installed = True
+            @wraps(original)
+            def observed(*args, **kwargs):
+                context = getattr(self, "_generation_context", None)
+                execution = getattr(context, "execution", None)
+                if execution is None:
+                    return original(*args, **kwargs)
+                bound = signature.bind_partial(*args, **kwargs)
+                extra = bound.arguments.setdefault(extra_key, {}) if extra_key else {}
+
+                def get_argument(key):
+                    return bound.arguments.get(key, extra.get(key))
+
+                def set_argument(key, value):
+                    if key in signature.parameters:
+                        bound.arguments[key] = value
+                    else:
+                        extra[key] = value
+
+                if name == "add_film_grain":
+                    try:
+                        enabled = float(get_argument("grain_intensity") or 0) > 0
+                    except (TypeError, ValueError):
+                        enabled = False
+                    if not enabled:
+                        return original(*args, **kwargs)
+                task_id, epoch = execution
+                if not self._stage_timing.begin_enhancement(task_id, epoch, label):
+                    return original(*args, **kwargs)
+                try:
+                    callback = get_argument("progress_callback")
+                    if callable(callback):
+                        method = str(get_argument("spatial_upsampling") or "").strip().lower()
+                        if name == "perform_spatial_upsampling" and method.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)):
+                            performance = _new_performance_observer(task_id)
+                            self._latest_performance = performance
+                            callback = _observe_postprocessing_progress(performance, callback, torch_module)
+
+                        @wraps(callback)
+                        def progress(phase, current_step=None, total_steps=None, unit=None):
+                            self._stage_timing.observe_enhancement_progress(task_id, epoch, phase, current_step, total_steps, unit)
+                            if unit is not None:
+                                return callback(phase, current_step, total_steps, unit)
+                            return callback(phase, current_step, total_steps)
+
+                        set_argument("progress_callback", progress)
+                    status_callback = get_argument("status_callback")
+                    if callable(status_callback):
+                        @wraps(status_callback)
+                        def status(phase, *status_args, **status_kwargs):
+                            self._stage_timing.observe_enhancement_progress(task_id, epoch, phase)
+                            return status_callback(phase, *status_args, **status_kwargs)
+                        set_argument("status_callback", status)
+                    return original(*bound.args, **bound.kwargs)
+                finally:
+                    self._stage_timing.end_enhancement(task_id, epoch)
+
+            observed._status_pro_postprocessing_step_observer = True
+            return observed
+
+        def install(target, name, label, is_global=False):
+            original = getattr(target, name, None)
+            if not callable(original):
+                return False
+            if not getattr(original, "_status_pro_postprocessing_step_observer", False):
+                observed = wrap_processor(original, name, label)
+                if is_global:
+                    self.set_global(name, observed)
+                setattr(target, name, observed)
+            return True
+
+        installed = False
+        for name in ("perform_spatial_upsampling", "perform_temporal_upsampling"):
+            installed = install(self, name, "Upsampling", is_global=True) or installed
+        for module_name, entries in (
+            ("postprocessing.audio_processors", ("generate_soundtrack", "replace_voice_tracks", "process_audio_file")),
+            ("postprocessing.film_grain", ("add_film_grain",)),
+        ):
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue  # Older WanGP versions may not expose these processors.
+            for name in entries:
+                label = "Film Grain" if name == "add_film_grain" else "Audio Post Processing"
+                installed = install(module, name, label) or installed
+        self._postprocessing_step_observer_installed = installed
 
     def _run_snapshot_json(self, state):
         try:
@@ -2817,7 +3048,7 @@ class StatusLitePlugin(WAN2GPPlugin):
 
         if (/\b(?:denois|diffus|sampl|synthesis|synthes|generating\s+(?:audio|waveform|speech)|spectrum\s+smoothing\s+replay)/.test(name)) return "denoise";
         if (/(?:vae\s*decod|decod|reconstruct)/.test(name)) return "decode";
-        if (/(?:post.?process|upscal|upsampl|spatial refin|distilled refinement|interpol|color correction|film grain|tcdecoder|seedvc|voice replacement|audio post|soundtrack|enhanc)/.test(name)) return "post";
+        if (/(?:post.?process|upscal|upsampl|dlss|spatial refin|distilled refinement|interpol|color correction|film grain|tcdecoder|seedvc|voice replacement|audio post|soundtrack|enhanc)/.test(name)) return "post";
         if (/(?:encod|prompt|condition|embed|feature|token)/.test(name)) return "encode";
         if (/(?:prepar|initial|load|download|queue|cache|start)/.test(name)) return "prepare";
         return "prepare";
@@ -2827,13 +3058,18 @@ class StatusLitePlugin(WAN2GPPlugin):
     const STRUCTURED_PHASE_STAGE_RULES = [
         ["save", ["saving", "saved", "save output", "exporting", "writing output", "muxing", "remuxing", "finalizing"]],
         ["input", ["encoding hum carrier", "vae encoding", "vae encode", "input preprocessing", "preparing input", "preparing control",
-            "loading control", "extracting pose", "extracting depth", "removing reference background"]],
+            "loading control", "extracting pose", "extracting depth", "extracting face movements", "preprocessing video",
+            "removing images references background", "removing reference background", "encoding h3 control video", "encoding h3 known frames"]],
         ["encode", ["encoding prompt", "encoding text prompt", "text encoding", "prompt encoding", "preparing conditioning",
-            "conditioning", "building embeddings", "text features"]],
-        ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "reconstructing"]],
-        ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial refinement",
+            "conditioning", "building embeddings", "text features", "enhancing prompt", "captioning images",
+            "encoding image", "encoding reference image", "encoding h3 prompt", "encoding h3 phase 2 prompt",
+            "preparing image conditioning", "preparing image and video conditioning"]],
+        ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding h3 stereo audio", "reconstructing"]],
+        ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling",
+            "temporal upsampling", "dlss", "adding film grain", "applying media post processing", "spatial refinement",
             "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
-            "seedvc", "voice replacement", "audio post processing"]],
+            "seedvc", "voice replacement", "replace voice", "mmaudio soundtrack generation",
+            "prismaudio soundtrack generation", "audio post processing"]],
         ["denoise", ["denoising", "diffusion", "sampling", "generating audio", "generating waveform",
             "generating speech", "spectrum smoothing replay", "yue2 score", "yue2 semantic audio", "yue2 acoustic synthesis"]],
         ["prepare", ["preparing", "initializing", "loading model", "downloading model", "compiling", "warming up"]]
@@ -2843,6 +3079,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         let phase = String(rawPhase || "").trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
         if (!phase) return null;
         phase = phase.replace(/^(?:(?:prompt|sample|sliding window|window|chunk|task|step|phase|pass|video)\s+\d+\s*\/\s*\d+\s*,?\s*)+/, "").replace(/^[ \-,:|]+/, "");
+        if (/(?:^|\s+-\s+)audio\s+-\s+/i.test(String(rawPhase || ""))) return "post";
         if (phase.includes("yue2 audio decoding")) return "decode";
         for (const [stageId, phrases] of STRUCTURED_PHASE_STAGE_RULES) {
             if (phrases.some(phrase => phase === phrase || phase.startsWith(phrase + " ") ||
@@ -3112,6 +3349,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!structuredTransitionEvidence(snapshot) && !explicitNextDenoise) return false;
         if (snapshot.id === "denoise" && ["decode", "post"].includes(state.currentId)) return true;
         if (snapshot.id === "decode" && state.currentId === "post") return true;
+        if (snapshot.id === "encode" && ["denoise", "decode", "post"].includes(state.currentId)) return true;
+        if (snapshot.id === "post" && state.currentId === "save" && snapshot.taskOwned) return true;
         return false;
     }
 
@@ -3143,7 +3382,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             };
             state.phaseOrder.push(state.currentPhaseId);
         }
-        if (phase.kind === "denoise" && Number.isFinite(phase.phaseNumber)) {
+        if (snapshot.id === "denoise" && phase.kind === "denoise" && Number.isFinite(phase.phaseNumber)) {
             state.activeDenoisePhase = phase.phaseNumber;
             state.lastDenoisePhase = phase.phaseNumber;
         }
@@ -3813,7 +4052,8 @@ class StatusLitePlugin(WAN2GPPlugin):
     function formatCounter(steps) {
         if (!steps || !Number.isFinite(steps.current)) return "";
         if (!Number.isFinite(steps.total)) {
-            return /^tokens?$/i.test(String(steps.unit || "")) ? `${steps.current} tokens` : "";
+            const unit = String(steps.unit || "");
+            return /^tokens?$/i.test(unit) ? `${steps.current} tokens` : (unit ? `${steps.current} ${unit} completed` : "");
         }
         if (["step", "steps"].includes(String(steps.unit || "steps").toLowerCase())) {
             return `Step ${steps.current}/${steps.total}`;
@@ -3836,7 +4076,12 @@ class StatusLitePlugin(WAN2GPPlugin):
     function readReportedPhaseStatus(namespace) {
         if (!namespace.activeRun) return null;
         const telemetry = namespace.runTelemetry;
-        const native = telemetry && telemetry.native_progress;
+        const timingStage = authoritativeTimingActiveStage(namespace);
+        const timing = telemetry && telemetry.stage_timing;
+        const enhancement = timingStage === "post" && timing.enhancement;
+        const ownedProgress = timingStage && timing.progress && timing.progress.stage === timingStage
+            ? timing.progress : null;
+        const native = enhancement || ownedProgress || (telemetry && telemetry.native_progress);
         const reported = telemetry && telemetry.progress_phase;
         const phase = String(native && native.phase || (Array.isArray(reported) ? reported[0] : "") || "").trim();
         const taskSettings = telemetry && telemetry.active_task && telemetry.active_task.settings;
@@ -3848,11 +4093,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!phase) return null;
         const current = optionalNumber(native && native.current);
         const total = optionalNumber(native && native.total);
-        const measurable = !indexTtsDecode && current !== null && current >= 0 && total !== null && total > 0;
+        const decoderCounter = !/\bdecod\w*/i.test(phase) || ["tile", "tiles", "frame", "frames", "chunk", "chunks", "sample", "samples", "segment", "segments"].includes(String(native && native.unit || "").toLowerCase());
+        const measurable = !indexTtsDecode && decoderCounter && current !== null && current >= 0 && total !== null && total > 0 && current <= total;
         const stablePhase = normalizedPhaseLabel(phase, {current, total, unit: native && native.unit});
         const aborting = isStoppingStatus(phase) || isStoppingStatus(telemetry && telemetry.status);
         const authoritativeV13 = Boolean(native && telemetry.execution_task_known === true);
-        let structuredId = indexTtsDecode ? "decode" : (authoritativeV13 ? structuredStageId(stablePhase) : null);
+        let structuredId = enhancement ? "post" : (ownedProgress ? ownedProgress.stage : (indexTtsDecode ? "decode" : (authoritativeV13 ? structuredStageId(stablePhase) : null)));
         if (structuredId === "decode" && modelType.startsWith("minimax_h3_ref2va") &&
             authoritativeTimingActiveStage(namespace) === "encode") structuredId = "encode";
         const id = aborting
@@ -3875,6 +4121,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             progressScope: measurable ? "phase" : null,
             transitionEvidence: structuredId ? "structured" : (authoritativeV13 ? "structured-unknown" : "legacy"),
             structuredPhaseKnown: Boolean(structuredId),
+            taskOwned: Boolean(ownedProgress || enhancement),
             aborting, textOnly: true
         };
     }
@@ -3963,7 +4210,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             nativeEta: Number.isFinite(timing.total) && Number.isFinite(timing.elapsed) ? Math.max(0, timing.total - timing.elapsed) : null,
             progress: Number.isFinite(progress) && !aborting ? clamp(progress, 0, 100) : null,
             steps: aborting ? namespace.state.steps : steps,
-            progressScope: steps.total > 0 && steps.current >= 0 ? "phase" : null,
+            progressScope: steps.total > 0 && steps.current >= 0 && steps.current <= steps.total &&
+                (!/\bdecod\w*/i.test(rawName) || ["tile", "tiles", "frame", "frames", "chunk", "chunks", "sample", "samples", "segment", "segments"].includes(String(steps.unit || "").toLowerCase())) ? "phase" : null,
             transitionEvidence: "native-dom",
             aborting, textOnly: false
         };
@@ -4526,7 +4774,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             activeState.currentId = snapshot.id;
             const next = activeState.records[snapshot.id];
             const recoveredBaseline = next.recovered && next.state === "complete" && Number.isFinite(next.elapsed);
-            const resumableStage = ["input", "post"].includes(snapshot.id);
+            const resumableStage = ["input", "encode", "post", "save"].includes(snapshot.id);
             const elapsedBase = (recoveredBaseline || (resumableStage && next.state === "complete" && Number.isFinite(next.elapsed)))
                 ? next.elapsed
                 : 0;
@@ -4593,7 +4841,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         else record.eta = null;
         activeState.overallElapsed = snapshot.overallElapsed;
         const denoise = activeState.records.denoise;
-        activeState.steps = snapshot.id === "decode" && snapshot.progressScope !== "phase" && Number.isFinite(denoise.stepTotal)
+        activeState.steps = snapshot.id === "decode" && snapshot.progressScope !== "phase" &&
+            (!snapshot.steps || !snapshot.steps.unit || /^steps?$/i.test(String(snapshot.steps.unit))) && Number.isFinite(denoise.stepTotal)
             ? { current: denoise.stepTotal, total: denoise.stepTotal, unit: "steps" }
             : snapshot.steps;
     }
@@ -5291,7 +5540,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 timingStage === "prepare" && (!nativePhase || stageIdFor(nativePhase) === "prepare")) return loadingSnapshot;
             const lifecycleSnapshot = lifecycle && lifecycle.state === "unloading"
                 ? modelLifecycleSnapshot(namespace) : null;
-            if (lifecycleSnapshot) return lifecycleSnapshot;
+            if (lifecycleSnapshot && !(timingStage === "post" && telemetry.stage_timing.enhancement)) return lifecycleSnapshot;
             if (isStoppingStatus(telemetry.status)) return statusSnapshot(namespace, telemetry.status);
             const taskOwned = readReportedPhaseStatus(namespace);
             return taskOwned && taskOwned.transitionEvidence === "structured" && taskOwned.id === timingStage

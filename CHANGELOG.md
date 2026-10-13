@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Captured task-owned status labels and counters from the same native event, including prompt enhancement and input preprocessing.
+- Prevented denoising counters or invalid tile totals from producing false Decode percentages; repaired Qwen 2.1 tile totals from the actual latent decode dimensions and retained completed counts when a total is unknown.
+- Tracked soundtrack, voice processing and film grain in Enhance, including audio processing after an intermediate Save, and accumulated repeated H3 Encode passes.
+- Fixed spatial and temporal postprocessing remaining in Prepare or Decode. All processors now enter Enhance at their actual call boundary, including processors that emit no progress.
+- Kept processor-internal loading, encoding, denoising and decoding in Enhance, with task-owned frame/tile counters and cleanup after failures.
+- Recognised RIFE, DLSS and additional enhancement labels in both stage matchers, and preserved unit-aware LTX callbacks.
+
 ## 1.2.2 — 2026-10-06
 
 - Kept MiniMax H3 Ref2VA RefMod preview decoding in Encode until generation begins; output decoding remains in Decode.
