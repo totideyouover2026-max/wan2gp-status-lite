@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Tracked PiD loading and VAE conditioning in Enhance through the shared spatial/temporal dispatchers, recognised native PiD statuses, and recovered processor ownership from WanGP's active media-control scope when the generation entry wrapper is bypassed.
+
 - Reported H3's transformer handoff before phase-two latent upscaling as Enhance, exposed its layer counts, and recognised native low/high-resolution, tiled and audio-refinement generation statuses.
 
 - Kept worker stage timing, start/completion timestamps and recent completed executions available while a window is minimized; restored missed runs/windows without charging hidden work to Prepare or adding the refocus delay.

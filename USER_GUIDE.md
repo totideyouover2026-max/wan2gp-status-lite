@@ -28,6 +28,8 @@ On the final denoising step, the ETA counts down from recent completed step time
 
 IndexTTS speech segment progress appears in Generate. Its vocoder conditioning and waveform generation appear in Decode. When switching from IndexTTS to another model, Prepare shows the outgoing unload followed by the incoming load.
 
+PiD postprocessing keeps model loading, VAE encoding and sampling in **Enhance**, both during generation and when applied to an existing output. Its VAE encoding callback has no tile counter, so this part shows its activity and elapsed time without a percentage.
+
 H3 two-phase generation reports the intermediate model handoff and latent upscaling in **Enhance**, followed by **Encode** for phase-two prompt/reference conditioning and **Generate** for the second pass. Latent upscaler progress uses **layers**, separate from denoising steps. Final media decoding uses **Decode**.
 
 ## Minimized or background windows

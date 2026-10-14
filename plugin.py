@@ -203,7 +203,7 @@ STRUCTURED_PHASE_STAGE_RULES = (
                 "encoding image", "encoding reference image", "encoding h3 prompt", "encoding h3 phase 2 prompt",
                 "preparing image conditioning", "preparing image and video conditioning")),
     ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding h3 stereo audio", "reconstructing")),
-    ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling",
+    ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling", "pid", "pixel diffusion",
               "temporal upsampling", "dlss", "adding film grain", "applying media post processing", "spatial refinement",
               "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
               "seedvc", "voice replacement", "replace voice", "mmaudio soundtrack generation",
@@ -918,6 +918,32 @@ def _new_performance_observer(task_id=None):
     return observer
 
 
+def _processor_execution(owner):
+    """Use the plugin's worker scope, or WanGP's native media-control scope."""
+    context = getattr(owner, "_generation_context", None)
+    execution = getattr(context, "execution", None)
+    if execution is not None:
+        return execution
+    try:
+        module = importlib.import_module("shared.utils.media_control")
+    except ImportError:
+        return None  # Pre-V13 hosts rely on the generation observer.
+    reader = getattr(module, "current_control", None)
+    control = reader() if callable(reader) else None
+    gen = getattr(control, "gen", None)
+    task = gen.get("api_active_queue_task") if isinstance(gen, dict) else None
+    task_id = task.get("id") if isinstance(task, dict) else None
+    if task_id is None:
+        return None
+    timing = owner._stage_timing.snapshot()
+    if timing.get("task_id") not in (None, str(task_id)) or timing.get("completed_at") is not None:
+        return None
+    epoch = owner._stage_timing.start_task(task_id)
+    owner._stage_timing.observe_sample(task_id, gen.get("repeat_no"), execution_epoch=epoch)
+    owner._stage_timing.observe_window(task_id, gen.get("window_no"), execution_epoch=epoch)
+    return task_id, epoch
+
+
 def _observe_postprocessing_progress(performance, progress_callback, torch_module=None):
     """Capture registered postprocessor progress callbacks without inventing steps."""
     def observed(phase, current_step=None, total_steps=None, unit=None):
@@ -964,6 +990,7 @@ def _observe_postprocessing_progress(performance, progress_callback, torch_modul
             return progress_callback(phase, current_step, total_steps, unit)
         return progress_callback(phase, current_step, total_steps)
 
+    observed._status_pro_performance_observer = True
     return observed
 
 
@@ -1948,8 +1975,7 @@ class StatusLitePlugin(WAN2GPPlugin):
 
             @wraps(original)
             def observed(*args, **kwargs):
-                context = getattr(self, "_generation_context", None)
-                execution = getattr(context, "execution", None)
+                execution = _processor_execution(self)
                 if execution is None:
                     return original(*args, **kwargs)
                 bound = signature.bind_partial(*args, **kwargs)
@@ -1972,13 +1998,17 @@ class StatusLitePlugin(WAN2GPPlugin):
                     if not enabled:
                         return original(*args, **kwargs)
                 task_id, epoch = execution
-                if not self._stage_timing.begin_enhancement(task_id, epoch, label):
+                if not self._stage_timing.begin_enhancement(
+                    task_id, epoch, "PiD Spatial Upsampling" if str(get_argument("spatial_upsampling") or "").lower().startswith("pid") else label
+                ):
                     return original(*args, **kwargs)
                 try:
                     callback = get_argument("progress_callback")
                     if callable(callback):
                         method = str(get_argument("spatial_upsampling") or "").strip().lower()
-                        if name == "perform_spatial_upsampling" and method.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)):
+                        if (name in ("perform_spatial_upsampling", "upscale_postprocessing") and
+                                method.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)) and
+                                not getattr(callback, "_status_pro_performance_observer", False)):
                             performance = _new_performance_observer(task_id)
                             self._latest_performance = performance
                             callback = _observe_postprocessing_progress(performance, callback, torch_module)
@@ -2020,6 +2050,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         for name in ("perform_spatial_upsampling", "perform_temporal_upsampling"):
             installed = install(self, name, "Upsampling", is_global=True) or installed
         for module_name, entries in (
+            ("postprocessing.spatial_upsamplers", ("upscale_postprocessing",)),
+            ("postprocessing.temporal_upsamplers", ("temporal_upsample",)),
             ("postprocessing.audio_processors", ("generate_soundtrack", "replace_voice_tracks", "process_audio_file")),
             ("postprocessing.film_grain", ("add_film_grain",)),
         ):
@@ -2028,7 +2060,8 @@ class StatusLitePlugin(WAN2GPPlugin):
             except ImportError:
                 continue  # Older WanGP versions may not expose these processors.
             for name in entries:
-                label = "Film Grain" if name == "add_film_grain" else "Audio Post Processing"
+                label = {"add_film_grain": "Film Grain", "upscale_postprocessing": "Spatial Upsampling",
+                         "temporal_upsample": "Temporal Upsampling"}.get(name, "Audio Post Processing")
                 installed = install(module, name, label) or installed
         self._postprocessing_step_observer_installed = installed
 
@@ -3165,6 +3198,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (/\bencoding\s+hum\s+carrier\b/.test(name)) return "input";
         if (/\byue2\s+score\b/.test(name)) return "denoise";
 
+        if (/^(?:pid|pixel diffusion)\b/.test(name)) return "post";
+
         // Semantic prompt/text work belongs to Encode even when it uses words such as
         // "enhancing" or mentions references. Check it before media preprocessing.
         if (/(?:enhanc\w*\s+prompt|prompt\s+enhanc\w*|(?:prompt|text|caption)\s+(?:and\s+references?\s+)?encod\w*|encod\w*\s+(?:(?:h3\s+)?prompt|speaker\s+\d*\s*reference)|condition\w*|embed\w*|token\w*|text\s+feature)/.test(name)) return "encode";
@@ -3196,7 +3231,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             "encoding image", "encoding reference image", "encoding h3 prompt", "encoding h3 phase 2 prompt",
             "preparing image conditioning", "preparing image and video conditioning"]],
         ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding h3 stereo audio", "reconstructing"]],
-        ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling",
+        ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling", "pid", "pixel diffusion",
             "temporal upsampling", "dlss", "adding film grain", "applying media post processing", "spatial refinement",
             "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
             "seedvc", "voice replacement", "replace voice", "mmaudio soundtrack generation",
