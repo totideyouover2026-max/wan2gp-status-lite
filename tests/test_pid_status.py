@@ -22,6 +22,7 @@ class PiDStatusTests(unittest.TestCase):
         native_scope.control = types.SimpleNamespace(gen=gen)
         native = types.SimpleNamespace(current_control=lambda: getattr(native_scope, 'control', None))
         seen, forwarded = [], []
+        progress_callback_supplied = [False]
         def dispatcher(handler, sample, spatial_upsampling, *, main_offloadobj=None, **kwargs):
             # The real dispatcher loads the upscaler before its first callback.
             seen.append(timer.snapshot())
@@ -29,10 +30,12 @@ class PiDStatusTests(unittest.TestCase):
             if progress:
                 progress('PiD VAE Encode')
                 seen.append(timer.snapshot())
-                self.assertEqual(progress('PiD', 3, 60), 'callback-result')
+                label = 'Upsampling - Denoising' if str(spatial_upsampling).startswith(tuple(scope['LTX_POSTPROCESSING_MODEL_TYPES'])) else 'PiD'
+                result = progress(label, 3, 60)
+                if progress_callback_supplied[0]: self.assertEqual(result, 'callback-result')
                 seen.append(timer.snapshot())
             return sample, 'cache'
-        spatial = types.SimpleNamespace(upscale_postprocessing=dispatcher)
+        spatial = types.SimpleNamespace(upscale_postprocessing=dispatcher, method_progress_label=lambda value: 'PiD Spatial Upsampling' if value.startswith('pid') else 'Spatial Upsampling')
         temporal = types.SimpleNamespace(temporal_upsample=lambda *a, **k: None)
         modules = {'postprocessing.spatial_upsamplers': spatial,
                    'postprocessing.temporal_upsamplers': temporal,
@@ -45,6 +48,7 @@ class PiDStatusTests(unittest.TestCase):
         # Keep a reference to the host helper before plugin installation. A
         # native module dispatcher must still be observed through that alias.
         def host_helper(sample, spatial_upsampling, progress_callback=None):
+            progress_callback_supplied[0] = progress_callback is not None
             return spatial.upscale_postprocessing(None, sample, spatial_upsampling, progress_callback=progress_callback)
         owner.perform_spatial_upsampling = host_helper
         owner.set_global = lambda key, value: setattr(owner, key, value)
@@ -62,7 +66,7 @@ class PiDStatusTests(unittest.TestCase):
                 with patch.object(scope['importlib'], 'import_module', side_effect=imports):
                     self.assertEqual(alias('pixels', 'pid_flux2_post*4', cb), ('pixels', 'cache'))
                 self.assertEqual([x['last_stage'] for x in seen], ['post', 'post', 'post'])
-                self.assertEqual(seen[0]['enhancement']['phase'], 'PiD Spatial Upsampling')
+                self.assertIn('PiD Spatial Upsampling', seen[0]['enhancement']['phase'])
                 self.assertIsNone(seen[0]['progress']['current'])  # Clear the generation tile counter.
                 self.assertEqual(seen[1]['progress']['phase'], 'PiD VAE Encode')
                 self.assertIsNone(seen[1]['progress']['progress'])
@@ -104,6 +108,8 @@ class PiDStatusTests(unittest.TestCase):
         for case in ('foreign', 'finished', 'unowned', 'thread'):
             with self.subTest(case=case):
                 scope, owner, epoch, gen, native, imports, alias, spatial, cb, seen, forwarded = self.runtime('decode')
+                with patch.object(scope['importlib'], 'import_module', side_effect=imports):
+                    scope['_processor_execution'](owner)  # Bind this native operation before retiring it.
                 if case == 'foreign': gen['api_active_queue_task'] = {'id': 'other'}
                 if case == 'finished': owner._stage_timing.finish_task('task')
                 if case == 'unowned': native.control = None

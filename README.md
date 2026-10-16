@@ -54,3 +54,17 @@ Status Lite does not save prompts, settings, paths, outputs, performance records
 ## License
 
 See [LICENSE](LICENSE).
+
+## Development validation
+
+```powershell
+python -B -m unittest discover -s tests -v
+```
+
+The optional upstream compatibility audit runs WanGP's actual dispatcher functions with synthetic handlers, without loading GPU models:
+
+```powershell
+python -B tests/upstream_enhancement_audit.py
+```
+
+This explicit audit reads WanGP `main` from GitHub. Use `--ref COMMIT` to pin a revision, or `--upstream-root PATH` for an offline checkout. Normal unittest discovery has no network dependency.

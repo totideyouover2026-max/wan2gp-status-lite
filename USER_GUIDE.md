@@ -16,7 +16,7 @@ Status Lite prefers WanGP's native phase information, with V13 WangpProgress and
 
 Prepare shows the transformer or primary processing model. Inputs and Decode show the applicable VAE components. Encode shows the text encoder. Status Lite uses the task's actual processing metadata, so a gallery-applied LTX upscaler is shown as LTX rather than inheriting the model selected on the generation form.
 
-For gallery-applied LTX upscaling, `Distilled refinement` is part of Enhance. Inputs and Encode may appear between the initial upsampling setup and refinement; when Enhance resumes, its elapsed time includes that earlier Enhance work.
+For gallery-applied LTX upscaling, setup, conditioning and `Distilled refinement` all remain in Enhance. Their elapsed times accumulate in the same stage.
 
 ## Steps, passes, and subwindows
 
@@ -28,7 +28,7 @@ On the final denoising step, the ETA counts down from recent completed step time
 
 IndexTTS speech segment progress appears in Generate. Its vocoder conditioning and waveform generation appear in Decode. When switching from IndexTTS to another model, Prepare shows the outgoing unload followed by the incoming load.
 
-PiD postprocessing keeps model loading, VAE encoding and sampling in **Enhance**, both during generation and when applied to an existing output. Its VAE encoding callback has no tile counter, so this part shows its activity and elapsed time without a percentage.
+Registered enhancement operations keep model loading and their internal preprocessing, prompt encoding, sampling and decoding in **Enhance**, both during generation and when applied to an existing output. This includes spatial/temporal upscalers, refinement, soundtrack generation, voice processing, audio cleanup and film grain. Processor names come from WanGP's registry. Missing progress counters show activity and elapsed time without an invented percentage. VAE-based upscalers also use Enhance; early upscaler preparation returns to the generation pipeline when it finishes.
 
 H3 two-phase generation reports the intermediate model handoff and latent upscaling in **Enhance**, followed by **Encode** for phase-two prompt/reference conditioning and **Generate** for the second pass. Latent upscaler progress uses **layers**, separate from denoising steps. Final media decoding uses **Decode**.
 

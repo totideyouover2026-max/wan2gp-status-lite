@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Unified Enhance tracking across registered spatial/temporal upscalers, audio processors, film grain and VAE-based upscaling; preserved arbitrary processor status text, loading and internal encode/decode work in their owning enhancement scope.
+- Fixed processor ownership across later jobs and reused task IDs, retained progress units with older callbacks, and resumed generation after early VAE-upscaler preparation.
+- Added a processor-family regression matrix and a CPU-only audit against upstream WanGP dispatcher implementations (checked against de302eec64b6).
+
 - Tracked PiD loading and VAE conditioning in Enhance through the shared spatial/temporal dispatchers, recognised native PiD statuses, and recovered processor ownership from WanGP's active media-control scope when the generation entry wrapper is bypassed.
 
 - Reported H3's transformer handoff before phase-two latent upscaling as Enhance, exposed its layer counts, and recognised native low/high-resolution, tiled and audio-refinement generation statuses.

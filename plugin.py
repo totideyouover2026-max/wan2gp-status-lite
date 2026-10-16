@@ -541,7 +541,7 @@ class _StageTimingTelemetry:
 
     def _observe_stage_locked(self, stage_id, now, processor_entry=False):
         # Processor-internal encoding, sampling and decoding all belong to Enhance.
-        if self._enhancement_depth and stage_id in STRUCTURED_STAGE_ORDER:
+        if self._enhancement_depth:
             stage_id = "post"
         if stage_id not in STRUCTURED_STAGE_ORDER or (not processor_entry and not self._transition_allowed(stage_id)):
             return False
@@ -599,11 +599,11 @@ class _StageTimingTelemetry:
                 return False
             if not self._observe_stage_locked("post", self._now(None), processor_entry=True):
                 return False
-            if not self._enhancement_depth:
-                # Do not inherit the generation VAE's stale counter on entry.
-                self._enhancement_progress = _validated_phase_progress(label)
-                self._enhancement_progress["stage"] = "post"
-                self._progress = dict(self._enhancement_progress)
+            # Each real operation starts with its own label and counters,
+            # including a nested dispatcher that knows the selected handler.
+            self._enhancement_progress = _validated_phase_progress(label)
+            self._enhancement_progress["stage"] = "post"
+            self._progress = dict(self._enhancement_progress)
             self._enhancement_depth += 1
             self._revision += 1
             return True
@@ -618,12 +618,15 @@ class _StageTimingTelemetry:
             self._progress = dict(self._enhancement_progress)
             self._revision += 1
 
-    def end_enhancement(self, task_id, execution_epoch):
+    def end_enhancement(self, task_id, execution_epoch, resume=None):
         with self._lock:
             if self._task_id == str(task_id) and self._execution_epoch == execution_epoch:
                 self._enhancement_depth = max(0, self._enhancement_depth - 1)
                 if not self._enhancement_depth:
                     self._enhancement_progress = None
+                    if resume and resume.get("last_stage") in STRUCTURED_STAGE_ORDER:
+                        self._observe_stage_locked(resume["last_stage"], self._now(None), processor_entry=True)
+                        self._progress = resume.get("progress")
                 self._revision += 1
 
     def finish_task(self, task_id=None, now=None, completed=False):
@@ -919,7 +922,7 @@ def _new_performance_observer(task_id=None):
 
 
 def _processor_execution(owner):
-    """Use the plugin's worker scope, or WanGP's native media-control scope."""
+    """Resolve a processor's real worker execution, independent of model names."""
     context = getattr(owner, "_generation_context", None)
     execution = getattr(context, "execution", None)
     if execution is not None:
@@ -927,7 +930,7 @@ def _processor_execution(owner):
     try:
         module = importlib.import_module("shared.utils.media_control")
     except ImportError:
-        return None  # Pre-V13 hosts rely on the generation observer.
+        return None
     reader = getattr(module, "current_control", None)
     control = reader() if callable(reader) else None
     gen = getattr(control, "gen", None)
@@ -935,13 +938,38 @@ def _processor_execution(owner):
     task_id = task.get("id") if isinstance(task, dict) else None
     if task_id is None:
         return None
-    timing = owner._stage_timing.snapshot()
-    if timing.get("task_id") not in (None, str(task_id)) or timing.get("completed_at") is not None:
-        return None
-    epoch = owner._stage_timing.start_task(task_id)
+    # Cache ownership on this native operation, never on the last polled task.
+    # A new control can legitimately belong to the next job (or a repeated ID).
+    executions = getattr(control, "_status_stage_executions", None)
+    if executions is None:
+        executions = {}
+        control._status_stage_executions = executions
+    execution = executions.get(id(owner))
+    if execution is not None:
+        return execution if str(execution[0]) == str(task_id) else None
+    epoch = owner._stage_timing.start_task(task_id, new_execution=True)
+    execution = (task_id, epoch)
+    executions[id(owner)] = execution
     owner._stage_timing.observe_sample(task_id, gen.get("repeat_no"), execution_epoch=epoch)
     owner._stage_timing.observe_window(task_id, gen.get("window_no"), execution_epoch=epoch)
-    return task_id, epoch
+    return execution
+
+
+def _forward_processor_progress(callback, phase, current=None, total=None, unit=None):
+    """Keep units in telemetry while supporting hosts with three-argument callbacks."""
+    if not callable(callback):
+        return None
+    args = (phase, current, total)
+    if unit is not None:
+        try:
+            inspect.signature(callback).bind(*args, unit)
+        except TypeError:
+            pass
+        except (ValueError, AttributeError):
+            return callback(*args, unit)
+        else:
+            return callback(*args, unit)
+    return callback(*args)
 
 
 def _observe_postprocessing_progress(performance, progress_callback, torch_module=None):
@@ -953,8 +981,11 @@ def _observe_postprocessing_progress(performance, progress_callback, torch_modul
         except (TypeError, ValueError):
             current = total = None
         label = str(phase or "").strip()[:300]
+        import re
+        is_steps = str(unit or "").lower() in ("step", "steps") or (
+            not unit and bool(re.search(r"\b(?:denois|diffus|sampl|refin)\w*", label, re.I)))
         if (current is not None and total is not None and current > 0 and total > 0 and
-                (unit is None or str(unit).lower() in ("step", "steps"))):
+                is_steps):
             previous_step = performance.get("_last_step")
             previous_label = str(performance.get("_phase_label") or "")
             if label != previous_label or (previous_step is not None and current <= previous_step):
@@ -986,9 +1017,7 @@ def _observe_postprocessing_progress(performance, progress_callback, torch_modul
                     performance["steps_truncated"] = True
                 performance["_last_step_at"] = now
                 performance["_last_step"] = current
-        if unit is not None:
-            return progress_callback(phase, current_step, total_steps, unit)
-        return progress_callback(phase, current_step, total_steps)
+        return _forward_processor_progress(progress_callback, phase, current_step, total_steps, unit)
 
     observed._status_pro_performance_observer = True
     return observed
@@ -1639,6 +1668,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         self.request_global("build_callback")
         self.request_global("generate_media")
         self.request_global("perform_spatial_upsampling")
+        self.request_global("perform_image_spatial_upsampling")
         self.request_global("perform_temporal_upsampling")
         self.request_global("release_model")
         self.request_global("torch")
@@ -1717,7 +1747,15 @@ class StatusLitePlugin(WAN2GPPlugin):
             timing_snapshot = stage_timing.snapshot(task_id) if stage_timing is not None else {}
             execution_epoch = timing_snapshot.get("execution_epoch")
             # WanGP passes the transformer to build_callback, not the H3 pipeline.
-            runtime_model = getattr(original_builder, "__globals__", {}).get("wan_model", pipe)
+            runtime_builder = original_builder
+            while hasattr(runtime_builder, "__wrapped__"):
+                runtime_builder = runtime_builder.__wrapped__
+            runtime_model = getattr(runtime_builder, "__globals__", {}).get("wan_model", pipe)
+            observe_model = getattr(self, "_observe_model_enhancements", None)
+            if callable(observe_model):
+                observe_model(runtime_model)
+            if context is not None:
+                _install_qwen21_tile_observer(runtime_model, context)
             handoff = _install_h3_handoff_observer(runtime_model, context, stage_timing, gen, task_id, execution_epoch)
             observer_id = f"{time.time_ns()}"
             performance = _new_performance_observer(task_id)
@@ -1968,7 +2006,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             return
         torch_module = getattr(self, "torch", None)
 
-        def wrap_processor(original, name, label):
+        def wrap_processor(original, name, label, resolver=None, output_vae=None):
             signature = inspect.signature(original)
             extra_key = next((key for key, value in signature.parameters.items()
                               if value.kind == inspect.Parameter.VAR_KEYWORD), None)
@@ -1990,6 +2028,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                     else:
                         extra[key] = value
 
+                method = next((get_argument(key) for key in ("spatial_upsampling", "temporal_upsampling", "method")
+                               if get_argument(key) is not None), None)
+                if method is not None and not str(method).strip():
+                    return original(*args, **kwargs)
+                if name == "prepare_vae_upsampler" and get_argument("handler") is None:
+                    return original(*args, **kwargs)
                 if name == "add_film_grain":
                     try:
                         enabled = float(get_argument("grain_intensity") or 0) > 0
@@ -1998,71 +2042,116 @@ class StatusLitePlugin(WAN2GPPlugin):
                     if not enabled:
                         return original(*args, **kwargs)
                 task_id, epoch = execution
-                if not self._stage_timing.begin_enhancement(
-                    task_id, epoch, "PiD Spatial Upsampling" if str(get_argument("spatial_upsampling") or "").lower().startswith("pid") else label
-                ):
+                previous = self._stage_timing.snapshot(task_id)
+                if output_vae is not None and (
+                        not getattr(output_vae, "upsampling_set", None) or
+                        not previous.get("stages", {}).get("denoise", {}).get("run_count") or
+                        previous.get("last_stage") not in ("denoise", "decode")):
+                    return original(*args, **kwargs)  # Conditioning/preview VAE work.
+                activity = label
+                if callable(resolver) and method:
+                    try:
+                        detail = str(resolver(method) or "").strip()
+                        if detail:
+                            activity = detail if detail.lower().startswith(label.lower()) else f"{label} - {detail}"
+                    except Exception:
+                        pass  # Optional display metadata must not stop processing.
+                if not self._stage_timing.begin_enhancement(task_id, epoch, activity):
                     return original(*args, **kwargs)
+                accepting = True
                 try:
                     callback = get_argument("progress_callback")
-                    if callable(callback):
-                        method = str(get_argument("spatial_upsampling") or "").strip().lower()
-                        if (name in ("perform_spatial_upsampling", "upscale_postprocessing") and
-                                method.startswith(tuple(LTX_POSTPROCESSING_MODEL_TYPES)) and
-                                not getattr(callback, "_status_pro_performance_observer", False)):
+                    if callable(callback) or "progress_callback" in signature.parameters or extra_key:
+                        performance = None
+                        if not getattr(callback, "_status_pro_performance_observer", False):
                             performance = _new_performance_observer(task_id)
-                            self._latest_performance = performance
                             callback = _observe_postprocessing_progress(performance, callback, torch_module)
 
-                        @wraps(callback)
                         def progress(phase, current_step=None, total_steps=None, unit=None):
-                            self._stage_timing.observe_enhancement_progress(task_id, epoch, phase, current_step, total_steps, unit)
-                            if unit is not None:
-                                return callback(phase, current_step, total_steps, unit)
-                            return callback(phase, current_step, total_steps)
+                            if accepting:
+                                self._stage_timing.observe_enhancement_progress(task_id, epoch, phase, current_step, total_steps, unit)
+                            result = _forward_processor_progress(callback, phase, current_step, total_steps, unit)
+                            if accepting and performance is not None and performance["steps"]:
+                                self._latest_performance = performance
+                            return result
 
+                        # Expose our actual four-argument signature to WanGP's
+                        # unit adapter, even when the supplied callback uses three.
+                        progress._status_pro_performance_observer = True
                         set_argument("progress_callback", progress)
                     status_callback = get_argument("status_callback")
-                    if callable(status_callback):
-                        @wraps(status_callback)
+                    if callable(status_callback) or "status_callback" in signature.parameters:
                         def status(phase, *status_args, **status_kwargs):
-                            self._stage_timing.observe_enhancement_progress(task_id, epoch, phase)
-                            return status_callback(phase, *status_args, **status_kwargs)
+                            if accepting:
+                                self._stage_timing.observe_enhancement_progress(task_id, epoch, phase)
+                            if callable(status_callback):
+                                return status_callback(phase, *status_args, **status_kwargs)
                         set_argument("status_callback", status)
-                    return original(*bound.args, **bound.kwargs)
+                    send_cmd = get_argument("send_cmd")
+                    if callable(send_cmd):
+                        @wraps(send_cmd)
+                        def send(command, data=None, *send_args, **send_kwargs):
+                            if accepting and command in ("progress", "status"):
+                                phase = data
+                                current = total = unit = None
+                                if command == "progress" and isinstance(data, (list, tuple)) and len(data) > 1:
+                                    phase = data[1]
+                                    amount = data[0] if isinstance(data[0], (list, tuple)) else ()
+                                    current = amount[0] if amount else None
+                                    total = amount[1] if len(amount) > 1 else None
+                                    unit = data[3] if len(data) > 3 else None
+                                self._stage_timing.observe_enhancement_progress(task_id, epoch, phase, current, total, unit)
+                            return send_cmd(command, data, *send_args, **send_kwargs)
+                        set_argument("send_cmd", send)
+                    result = original(*bound.args, **bound.kwargs)
+                    if name == "prepare_vae_upsampler" and result is not None:
+                        for entry in ("decode_inputs", "decode"):
+                            install(result, entry, "VAE Upsampling")
+                    return result
                 finally:
-                    self._stage_timing.end_enhancement(task_id, epoch)
+                    accepting = False
+                    # VAE upscaler preparation can precede text encoding/sampling.
+                    resume = previous if name == "prepare_vae_upsampler" else None
+                    self._stage_timing.end_enhancement(task_id, epoch, resume=resume)
 
             observed._status_pro_postprocessing_step_observer = True
             return observed
 
-        def install(target, name, label, is_global=False):
+        def install(target, name, label, is_global=False, resolver=None, output_vae=None):
             original = getattr(target, name, None)
             if not callable(original):
                 return False
             if not getattr(original, "_status_pro_postprocessing_step_observer", False):
-                observed = wrap_processor(original, name, label)
+                observed = wrap_processor(original, name, label, resolver, output_vae)
                 if is_global:
                     self.set_global(name, observed)
                 setattr(target, name, observed)
             return True
 
+        def observe_model(model):
+            vae = getattr(model, "vae", None)
+            if vae is not None and getattr(vae, "upsampling_set", None):
+                for entry in ("decode", "decode_to_cpu_uint8"):
+                    install(vae, entry, "VAE Upsampling", output_vae=vae)
+
+        self._observe_model_enhancements = observe_model
         installed = False
-        for name in ("perform_spatial_upsampling", "perform_temporal_upsampling"):
-            installed = install(self, name, "Upsampling", is_global=True) or installed
-        for module_name, entries in (
-            ("postprocessing.spatial_upsamplers", ("upscale_postprocessing",)),
-            ("postprocessing.temporal_upsamplers", ("temporal_upsample",)),
-            ("postprocessing.audio_processors", ("generate_soundtrack", "replace_voice_tracks", "process_audio_file")),
-            ("postprocessing.film_grain", ("add_film_grain",)),
+        for name, label in (("perform_spatial_upsampling", "Spatial Upsampling"),
+                            ("perform_image_spatial_upsampling", "Spatial Upsampling"),
+                            ("perform_temporal_upsampling", "Temporal Upsampling")):
+            installed = install(self, name, label, is_global=True) or installed
+        for module_name, entries, label, display in (
+            ("postprocessing.spatial_upsamplers", ("upscale_postprocessing", "prepare_vae_upsampler", "post_model_process_vae_upsampling"), "Spatial Upsampling", "method_progress_label"),
+            ("postprocessing.temporal_upsamplers", ("temporal_upsample",), "Temporal Upsampling", "format_temporal_upsampling_label"),
+            ("postprocessing.audio_processors", ("generate_soundtrack", "replace_voice_tracks", "process_audio_file", "_dispatch_processor"), "Audio Post Processing", "format_method_label"),
+            ("postprocessing.film_grain", ("add_film_grain",), "Film Grain", None),
         ):
             try:
                 module = importlib.import_module(module_name)
             except ImportError:
-                continue  # Older WanGP versions may not expose these processors.
+                continue
             for name in entries:
-                label = {"add_film_grain": "Film Grain", "upscale_postprocessing": "Spatial Upsampling",
-                         "temporal_upsample": "Temporal Upsampling"}.get(name, "Audio Post Processing")
-                installed = install(module, name, label) or installed
+                installed = install(module, name, label, resolver=getattr(module, display, None) if display else None) or installed
         self._postprocessing_step_observer_installed = installed
 
     def _run_snapshot_json(self, state):
