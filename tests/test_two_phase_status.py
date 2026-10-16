@@ -119,7 +119,7 @@ class TwoPhaseTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node.js unavailable")
     def test_browser_two_phase_transitions_override_stale_decode(self):
         js = _javascript_with_exports("freshState", "readLiveSnapshot", "applySnapshot", "applyServerStageTiming",
-                                     "structuredStageId", "phaseInfo", "formatCounter")
+                                     "structuredStageId", "phaseInfo", "formatCounter", "normalizedPhaseLabel")
         script = r"""
 const api = globalThis.__statusProReleaseTest;
 function check(v,m) {if (!v) throw new Error(m);}
@@ -134,7 +134,8 @@ for (const [stage,phase,current,total,unit] of events) {
    progress:{stage,phase,current:current??null,total:total??null,unit:unit??null}};
  api.applyServerStageTiming(ns,ns.runTelemetry);
  const snapshot=api.readLiveSnapshot(ns);
- check(snapshot.id===stage && snapshot.rawName===phase,'stale Decode hid '+phase);
+ check(snapshot.id===stage && snapshot.rawName===api.normalizedPhaseLabel(phase,{current,total,unit}),'stale Decode hid '+phase);
+ check(snapshot.rawMessage===phase,'native activity message was lost');
  api.applySnapshot(ns,snapshot);
  check(ns.state.currentId===stage,'transition rejected '+phase);
  if (unit==='layers') check(api.formatCounter(snapshot.steps)==='7/35 layers' && snapshot.progress===20,'latent layers lost');

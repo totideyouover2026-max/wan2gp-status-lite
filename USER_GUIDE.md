@@ -28,6 +28,8 @@ On the final denoising step, the ETA counts down from recent completed step time
 
 IndexTTS speech segment progress appears in Generate. Its vocoder conditioning and waveform generation appear in Decode. When switching from IndexTTS to another model, Prepare shows the outgoing unload followed by the incoming load.
 
+Activity rows represent distinct processing phases. Changing generated-audio duration, elapsed time or progress counts update the current row; real parts, segments and passes remain separate. A completed activity retains its last reported counter, so speech ending before its maximum duration does not imply that the maximum frame or token count was reached.
+
 Registered enhancement operations keep model loading and their internal preprocessing, prompt encoding, sampling and decoding in **Enhance**, both during generation and when applied to an existing output. This includes spatial/temporal upscalers, refinement, soundtrack generation, voice processing, audio cleanup and film grain. Processor names come from WanGP's registry. Missing progress counters show activity and elapsed time without an invented percentage. VAE-based upscalers also use Enhance; early upscaler preparation returns to the generation pipeline when it finishes.
 
 H3 two-phase generation reports the intermediate model handoff and latent upscaling in **Enhance**, followed by **Encode** for phase-two prompt/reference conditioning and **Generate** for the second pass. Latent upscaler progress uses **layers**, separate from denoising steps. Final media decoding uses **Decode**.

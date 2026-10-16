@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kept streaming voice/audio progress in one semantic activity as durations and counters change, including standalone-to-denoising callback handoffs, while preserving distinct parts, segments and passes.
+- Preserved the last reported counter when an activity ends instead of forcing it to its maximum; recognised native speech waveform decoding as Decode.
+
 - Unified Enhance tracking across registered spatial/temporal upscalers, audio processors, film grain and VAE-based upscaling; preserved arbitrary processor status text, loading and internal encode/decode work in their owning enhancement scope.
 - Fixed processor ownership across later jobs and reused task IDs, retained progress units with older callbacks, and resumed generation after early VAE-upscaler preparation.
 - Added a processor-family regression matrix and a CPU-only audit against upstream WanGP dispatcher implementations (checked against de302eec64b6).

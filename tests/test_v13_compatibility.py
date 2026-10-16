@@ -603,7 +603,7 @@ for (const sequence of [
     }
     const activities = api.stageActivities(ns.state, ns.state.records.encode);
     assert(activities.length > 0, "Encode phases missing");
-    assert(activities.filter(a => a.total).every(a => a.progress === 100 && a.current === a.total), "completed phase not finalized");
+    assert(activities.filter(a => a.total).every(a => a.state === "complete" && a.current === 4 && a.total === 12 && Math.abs(a.progress - 100/3) < 0.001), "activity closure changed the observed counter");
 }
 const repeated = namespace();
 for (const phase of ["Preparing Conditioning", "Encoding Text Prompt 1/2", "Preparing Conditioning", "Encoding Text Prompt 2/2"]) {

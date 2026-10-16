@@ -202,7 +202,7 @@ STRUCTURED_PHASE_STAGE_RULES = (
                 "conditioning", "building embeddings", "text features", "enhancing prompt", "captioning images",
                 "encoding image", "encoding reference image", "encoding h3 prompt", "encoding h3 phase 2 prompt",
                 "preparing image conditioning", "preparing image and video conditioning")),
-    ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding h3 stereo audio", "reconstructing")),
+    ("decode", ("vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding speech", "decoding h3 stereo audio", "reconstructing")),
     ("post", ("post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling", "pid", "pixel diffusion",
               "temporal upsampling", "dlss", "adding film grain", "applying media post processing", "spatial refinement",
               "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
@@ -3319,7 +3319,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             "conditioning", "building embeddings", "text features", "enhancing prompt", "captioning images",
             "encoding image", "encoding reference image", "encoding h3 prompt", "encoding h3 phase 2 prompt",
             "preparing image conditioning", "preparing image and video conditioning"]],
-        ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding h3 stereo audio", "reconstructing"]],
+        ["decode", ["vae decoding", "vae decode", "yue2 audio decoding", "audio decoding", "audio vae decoding", "decoding audio", "decoding speech", "decoding h3 stereo audio", "reconstructing"]],
         ["post", ["post processing", "post-processing", "upsampling", "upscaling", "spatial upsampling", "pid", "pixel diffusion",
             "temporal upsampling", "dlss", "adding film grain", "applying media post processing", "spatial refinement",
             "distilled refinement", "interpolation", "color correction", "film grain", "tcdecoder",
@@ -3354,6 +3354,23 @@ class StatusLitePlugin(WAN2GPPlugin):
         const current = optionalNumber(progress && progress.current);
         const total = optionalNumber(progress && progress.total);
         const unit = String(progress && progress.unit || "").trim().toLowerCase();
+        // Native status strings mix the activity name with changing measurements.
+        // Remove only delimited metric suffixes, retaining part/pass/chunk labels.
+        const duration = "(?:\\d+(?:\\.\\d+)?\\s*[hms]\\s*)+";
+        const timingSuffix = new RegExp("\\s*(?:\\||:|\\s[-–—])\\s*" + duration +
+            "(?:\\s*/\\s*" + duration + ")?(?:\\s*(?:elapsed|remaining|left))?\\s*$", "i");
+        let previous;
+        do {
+            previous = label;
+            label = label.replace(timingSuffix, "").trim();
+            const counter = label.match(/(?:\s*[:|]\s*|\s+[-–—]\s+|\s+)\(?(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)(?:\s+(tokens?|tiles?|layers?|steps?|frames?|segments?|chunks?|samples?|seconds?|s))?\s*\)?\s*$/i);
+            const structuralCounter = counter && /\b(?:phase|pass|part|segment|window|chunk|prompt|sample|speaker|reference|video|voice|track|sentence|utterance|view|take|shot|scene)\s*$/i.test(label.slice(0, counter.index));
+            const counterUnit = counter && String(counter[3] || "").toLowerCase().replace(/^s$/, "second").replace(/s$/, "");
+            if (counter && !structuralCounter && current === Number(counter[1]) && total === Number(counter[2]) &&
+                (!counterUnit || !unit || counterUnit === unit.replace(/^s$/, "second").replace(/s$/, ""))) {
+                label = label.slice(0, counter.index).trim();
+            }
+        } while (label && label !== previous);
         if (yueTokenCounter(label) || (Number.isFinite(current) && Number.isFinite(total) && unit)) {
             const suffix = label.match(/:\s*\d+(?:\.\d+)?\s+(tokens?|tiles?|layers?|steps?)\s*$/i);
             if (suffix && (yueTokenCounter(label) || suffix[1].toLowerCase().replace(/s$/, "") === unit.replace(/s$/, ""))) {
@@ -3374,7 +3391,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         const phaseNumber = phaseMatch
             ? ({ first: 1, second: 2, third: 3 }[phaseMatch[1].toLowerCase()] || Number.parseInt(phaseMatch[1], 10))
             : (nativePhaseMatch ? Number.parseInt(nativePhaseMatch[1], 10) : null);
-        const key = label.toLowerCase()
+        // Some models emit a standalone activity before the generic callback
+        // adds "Denoising |". That wrapper is not a new activity or a new pass.
+        const genericDenoise = label.match(/^denoising\s*\|\s*(.+)$/i);
+        const identity = genericDenoise && structuredStageId(genericDenoise[1]) === kind
+            ? genericDenoise[1] : label;
+        const key = identity.toLowerCase()
             .replace(/[^a-z0-9]+/g, "-")
             .replace(/^-+|-+$/g, "") || kind;
         return { id: `${kind}:${key}`, kind, label, phaseNumber };
@@ -3569,10 +3591,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (!record || record.state !== "current") return;
         record.elapsed = (Date.now() - record.startedAt) / 1000;
         record.state = "complete";
-        if (Number.isFinite(record.total) && record.total > 0) {
-            record.current = record.total;
-            record.progress = 100;
-        }
+        // Ending an activity does not prove its advertised maximum was reached
+        // (speech can finish on EOS, silence detection or early stop).
     }
 
     function resetDownstreamStagesForNextDenoisePhase(state) {
