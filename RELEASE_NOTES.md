@@ -1,4 +1,17 @@
-# Status Lite 1.2.2
+# Status Lite 1.3.0
+
+Status Lite 1.3.0 improves enhancement-stage tracking, background timing recovery and voice/audio activity reporting.
+
+- Track registered spatial/temporal upscalers, VAE upscaling, refinement, soundtrack generation, voice processing, audio cleanup and film grain in Enhance, including model loading and internal encode/decode work.
+- Show H3's inter-pass model handoff and latent upscaling in Enhance, with clearer second-phase transitions.
+- Recover stage timing after the window is minimized or unfocused, without assigning hidden work or the refocus delay to Prepare.
+- Correct Qwen 2.1 tile totals and suppress misleading Decode percentages from stale or invalid counters.
+- Keep streaming voice/audio updates in one activity while preserving real parts, segments and passes; retain actual counters when an activity ends.
+- Improve ownership across queued jobs and repeated task IDs, with broader regression coverage and an audit against upstream WanGP dispatcher APIs.
+
+Status Lite remains live-only, with no saved generation History or run import/export.
+
+## Status Lite 1.2.2
 
 Status Lite 1.2.2 keeps H3 RefMod preview decoding in Encode and tracks each additional sample requested with One More, returning to the new sample's live stages after the previous sample's Save.
 

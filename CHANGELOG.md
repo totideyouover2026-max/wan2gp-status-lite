@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-10-17
 
 - Kept streaming voice/audio progress in one semantic activity as durations and counters change, including standalone-to-denoising callback handoffs, while preserving distinct parts, segments and passes.
 - Preserved the last reported counter when an activity ends instead of forcing it to its maximum; recognised native speech waveform decoding as Decode.
