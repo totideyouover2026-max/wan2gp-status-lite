@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Kept worker ownership authoritative between queued jobs so a previous image's Save status cannot seed the next video's timing, including H3 runs with the model kept loaded.
+- Published task ownership from the generation observer for hosts without the native active-task field, while retaining the legacy fallback when the observer is unavailable.
+
 ## 1.3.0 — 2026-10-17
 
 - Kept streaming voice/audio progress in one semantic activity as durations and counters change, including standalone-to-denoising callback handoffs, while preserving distinct parts, segments and passes.

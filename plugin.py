@@ -1977,6 +1977,12 @@ class StatusLitePlugin(WAN2GPPlugin):
             previous_decoder_total = getattr(self._generation_context, "decoder_tile_total", None)
             self._generation_context.decoder_tile_total = None
             self._generation_context.execution = (task_id, execution_epoch)
+            # Publish worker ownership for hosts without api_active_queue_task too.
+            # Queue membership alone does not mean a task has started executing.
+            worker_gen = state_gen if isinstance(state_gen, dict) else {}
+            previous_worker = worker_gen.get("_status_lite_execution_task")
+            worker = {"task": task, "execution_epoch": execution_epoch}
+            worker_gen["_status_lite_execution_task"] = worker
             try:
                 result = original(task, *call_args, **kwargs)
                 return result
@@ -1987,6 +1993,11 @@ class StatusLitePlugin(WAN2GPPlugin):
                 self._generation_context.execution = previous_execution
                 self._generation_context.decoder_tile_total = previous_decoder_total
                 self._stage_timing.finish_task(task_id, completed=bool(result))
+                if worker_gen.get("_status_lite_execution_task") is worker:
+                    if previous_worker is None:
+                        worker_gen.pop("_status_lite_execution_task", None)
+                    else:
+                        worker_gen["_status_lite_execution_task"] = previous_worker
                 state_gen = state.get("gen") if isinstance(state, dict) and isinstance(state.get("gen"), dict) else {}
                 if task_outcomes is not None:
                     task_outcomes.finish(
@@ -2160,8 +2171,12 @@ class StatusLitePlugin(WAN2GPPlugin):
             gen = state.get("gen") if isinstance(state.get("gen"), dict) else {}
             queue = gen.get("queue") if isinstance(gen.get("queue"), list) else []
             timing_task_id = None
-            execution_task_known = "api_active_queue_task" in gen
-            executing_source = gen.get("api_active_queue_task") if execution_task_known else None
+            # WanGP removes api_active_queue_task between jobs. Its absence is
+            # an idle worker, not evidence that this host needs the legacy fallback.
+            execution_task_known = bool(getattr(self, "_generation_timing_observer_installed", False) or
+                                        "api_active_queue_task" in gen)
+            worker = gen.get("_status_lite_execution_task")
+            executing_source = worker.get("task") if isinstance(worker, dict) else gen.get("api_active_queue_task")
             executing_task = _task_telemetry(
                 executing_source,
                 get_model_name=getattr(self, "get_model_name", None),
@@ -2227,7 +2242,9 @@ class StatusLitePlugin(WAN2GPPlugin):
                                              self._stage_timing),
                         execution_epoch=timing_epoch,
                     )
-            elif execution_task_known:
+            elif execution_task_known and not getattr(self, "_generation_timing_observer_installed", False):
+                # The generation observer owns completion when installed. An idle
+                # poll may race with its entry before worker ownership is published.
                 self._stage_timing.finish_task(completed=False)
             if active_task and gen.get("sliding_window"):
                 window_prompts = _window_prompts(
