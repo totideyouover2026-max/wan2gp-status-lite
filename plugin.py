@@ -2225,23 +2225,26 @@ class StatusLitePlugin(WAN2GPPlugin):
                 ) if fallback_source else None
             )
             if active_task:
-                self._active_task_id = active_task.get("id")
-                timing_task_id = self._active_task_id
-                timing_epoch = self._stage_timing.start_task(timing_task_id)
-                self._stage_timing.observe_sample(timing_task_id, gen.get("repeat_no"), execution_epoch=timing_epoch)
-                self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
-                native_phase = _native_progress_snapshot(gen).get("phase")
-                _recover_polled_stage_timing(
-                    self._stage_timing, timing_task_id, timing_epoch, native_phase,
-                    gen.get("status"), execution_task_known,
-                )
-                if _task_model_type(executing_source if execution_task_known else fallback_source).startswith("index_tts"):
-                    self._stage_timing.observe_stage(
-                        timing_task_id,
-                        _task_owned_stage_id(executing_source if execution_task_known else fallback_source, native_phase,
-                                             self._stage_timing),
-                        execution_epoch=timing_epoch,
+                timing_task_id = active_task.get("id")
+                # Metadata can resolve after the worker has advanced to another
+                # task. Polls must never replace its epoch or reset its segments.
+                if not getattr(self, "_generation_timing_observer_installed", False):
+                    self._active_task_id = timing_task_id
+                    timing_epoch = self._stage_timing.start_task(timing_task_id)
+                    self._stage_timing.observe_sample(timing_task_id, gen.get("repeat_no"), execution_epoch=timing_epoch)
+                    self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
+                    native_phase = _native_progress_snapshot(gen).get("phase")
+                    _recover_polled_stage_timing(
+                        self._stage_timing, timing_task_id, timing_epoch, native_phase,
+                        gen.get("status"), execution_task_known,
                     )
+                    if _task_model_type(executing_source if execution_task_known else fallback_source).startswith("index_tts"):
+                        self._stage_timing.observe_stage(
+                            timing_task_id,
+                            _task_owned_stage_id(executing_source if execution_task_known else fallback_source, native_phase,
+                                                 self._stage_timing),
+                            execution_epoch=timing_epoch,
+                        )
             elif execution_task_known and not getattr(self, "_generation_timing_observer_installed", False):
                 # The generation observer owns completion when installed. An idle
                 # poll may race with its entry before worker ownership is published.

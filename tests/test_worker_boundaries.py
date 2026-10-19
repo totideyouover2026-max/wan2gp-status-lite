@@ -2,6 +2,7 @@
 import ast
 import json
 import types
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -88,7 +89,8 @@ class WorkerBoundaryTests(unittest.TestCase):
                     clock[0] = 3
                     state["gen"]["api_active_queue_task"] = video
                     ready = self.snapshot(scope, owner, state)
-                    self.assertEqual(ready["stage_timing"]["last_stage"], "prepare")
+                    # Selecting a queue task does not create a worker execution.
+                    self.assertEqual(ready["stage_timing"]["task_id"], "image")
                     owner.generate_media(video, publish, state=state)
                     final = self.snapshot(scope, owner, state)["stage_timing"]
                 self.assertEqual([s["stage_timing"]["last_stage"] for s in seen],
@@ -175,3 +177,92 @@ class WorkerBoundaryTests(unittest.TestCase):
                            seen[0]["stage_timing"]["execution_epoch"])
         self.assertTrue(seen[1]["stage_timing"]["stages"]["denoise"]["active"])
         self.assertIsNone(self.snapshot(scope, owner, state)["executing_task"])
+
+    def test_delayed_poll_after_abort_cannot_replace_next_workers_epoch(self):
+        scope = snapshot_helpers()
+        first = {"id": "aborted", "params": {}}
+        second = {"id": "queued", "params": {}}
+        third = {"id": "next", "params": {}}
+        state = {"gen": {"in_progress": True, "queue": [first], "repeat_no": 1, "window_no": 1}}
+        started, resume = threading.Event(), threading.Event()
+        observations, errors = [], []
+        def generate(task, send_cmd, state=None):
+            send_cmd("status", "Denoising")
+            if task is first:
+                state["gen"]["queue"].append(second)
+                state["gen"]["abort"] = True
+                return True  # WanGP returns success when it acknowledges abort.
+            if task is third:
+                observations.append(owner._stage_timing.snapshot())
+                started.set()
+                if not resume.wait(5):
+                    raise RuntimeError("test worker timed out")
+                send_cmd("progress", [(4, 10), "Denoising", 10, "steps"])
+                observations.append(owner._stage_timing.snapshot())
+            return True
+        owner = self.owner(scope, generate)
+        def publish(command, data):
+            if command == "status":
+                state["gen"]["status"] = data
+        state["gen"]["api_active_queue_task"] = first
+        owner.generate_media(first, publish, state=state)
+        state["gen"]["queue"].remove(first)
+        state["gen"]["abort"] = False
+        state["gen"]["api_active_queue_task"] = second
+        owner.generate_media(second, publish, state=state)
+        self.assertTrue(owner._task_outcomes.snapshot()[0]["aborted"])
+        self.assertTrue(owner._task_outcomes.snapshot()[1]["success"])
+        original_reader = scope["_task_telemetry"]
+        def run_third():
+            try:
+                owner.generate_media(third, publish, state=state)
+            except BaseException as error:
+                errors.append(error)
+                started.set()
+        worker = threading.Thread(target=run_third)
+        def delayed_metadata(task, **kwargs):
+            if task is second:
+                # The poll has read job 2, but metadata resolution can take long
+                # enough for the native queue worker to start job 3 concurrently.
+                state["gen"]["queue"] = [third]
+                state["gen"]["api_active_queue_task"] = third
+                worker.start()
+                self.assertTrue(started.wait(5))
+            return original_reader(task, **kwargs)
+        scope["_task_telemetry"] = delayed_metadata
+        try:
+            self.snapshot(scope, owner, state)  # Delayed job-2 poll returns.
+            current = self.snapshot(scope, owner, state)  # Normal job-3 poll.
+        finally:
+            resume.set()
+            if worker.ident is not None:
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(current["stage_timing"]["task_id"], "next")
+        self.assertEqual(current["stage_timing"]["execution_epoch"], observations[0]["execution_epoch"])
+        self.assertEqual(observations[1]["last_stage"], "denoise")
+        self.assertEqual(observations[1]["progress"]["current"], 4)
+        self.assertIsNone(observations[1]["completed_at"])
+
+    def test_poll_cannot_start_sample_or_window_before_worker_event(self):
+        scope = snapshot_helpers()
+        task = {"id": "task", "params": {}}
+        state = {"gen": {"in_progress": True, "api_active_queue_task": task,
+                         "queue": [task], "repeat_no": 1, "window_no": 1}}
+        def generate(task, send_cmd, state=None):
+            send_cmd("status", "Denoising")
+            before = owner._stage_timing.snapshot()
+            state["gen"].update(repeat_no=2, window_no=2)
+            polled = self.snapshot(scope, owner, state)["stage_timing"]
+            self.assertEqual(polled["revision"], before["revision"])
+            self.assertEqual(polled["last_stage"], "denoise")
+            self.assertEqual(polled["sample_no"], 1)
+            self.assertEqual(polled["window_no"], 1)
+            send_cmd("status", "Encoding Prompt")
+            after = owner._stage_timing.snapshot()
+            self.assertEqual(after["sample_no"], 2)
+            self.assertEqual(after["last_stage"], "encode")
+            return True
+        owner = self.owner(scope, generate)
+        owner.generate_media(task, lambda *args: None, state=state)
