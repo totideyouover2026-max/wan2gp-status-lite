@@ -120,6 +120,37 @@ class WorkerBoundaryTests(unittest.TestCase):
         self.assertIsNone(after["executing_task"])
         self.assertEqual(state, {"gen": {"in_progress": True, "queue": [task]}})
 
+    def test_installed_but_bypassed_worker_recovers_changing_speech_progress(self):
+        scope = snapshot_helpers()
+        owner = self.owner(scope, lambda *args, **kwargs: True)
+        task = {"id": "fish", "params": {"model_type": "fish_drama3_int4"}}
+        gen = {"in_progress": True, "api_active_queue_task": task, "queue": [task],
+               "progress_phase": ("Saving File previous.wav", -1)}
+        state = {"gen": gen}
+        for _ in range(2):
+            stale = self.snapshot(scope, owner, state)
+            self.assertEqual(stale["stage_timing"]["last_stage"], "prepare")
+        for count in (1, 50, 100):
+            label = f"Denoising | Generating Speech - {count / 10:.1f}s"
+            gen.update(progress_phase=(label, count), phase_progress_units=(1291, "frames"))
+            current = self.snapshot(scope, owner, state)
+            self.assertEqual(current["stage_timing"]["last_stage"], "denoise")
+            self.assertEqual(current["stage_timing"]["progress"]["current"], count)
+        # Repeated polls retain the recovered stage and epoch.
+        again = self.snapshot(scope, owner, state)
+        self.assertEqual(again["stage_timing"]["execution_epoch"], current["stage_timing"]["execution_epoch"])
+        self.assertEqual(again["stage_timing"]["last_stage"], "denoise")
+        gen["progress_phase"] = ("Saving File fish.wav", -1)
+        self.assertEqual(self.snapshot(scope, owner, state)["stage_timing"]["last_stage"], "save")
+        gen.pop("api_active_queue_task")
+        self.snapshot(scope, owner, state)
+        task2 = {"id": "next", "params": {}}
+        gen.update(api_active_queue_task=task2, queue=[task2])
+        next_run = self.snapshot(scope, owner, state)
+        self.assertEqual(next_run["stage_timing"]["last_stage"], "prepare")
+        gen["progress_phase"] = ("Encoding Text Prompt", 1)
+        self.assertEqual(self.snapshot(scope, owner, state)["stage_timing"]["last_stage"], "encode")
+
     def test_unobserved_legacy_host_keeps_queue_fallback(self):
         scope = snapshot_helpers()
         owner = self.owner(scope, lambda *args, **kwargs: True)

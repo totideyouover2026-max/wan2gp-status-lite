@@ -1913,6 +1913,9 @@ class StatusLitePlugin(WAN2GPPlugin):
 
         @wraps(original)
         def observed(task, *args, **kwargs):
+            # Installation alone does not prove the host calls this entry point.
+            # Set this before metadata work so concurrent polls cannot own timing.
+            self._generation_timing_observer_seen = True
             task_id = task.get("id") if isinstance(task, dict) else None
             self._active_task_id = task_id
             execution_epoch = self._stage_timing.start_task(task_id, new_execution=True)
@@ -2227,13 +2230,29 @@ class StatusLitePlugin(WAN2GPPlugin):
             if active_task:
                 timing_task_id = active_task.get("id")
                 # Metadata can resolve after the worker has advanced to another
-                # task. Polls must never replace its epoch or reset its segments.
-                if not getattr(self, "_generation_timing_observer_installed", False):
+                # task. Once seen, the worker owns epochs and segment boundaries.
+                if not getattr(self, "_generation_timing_observer_seen", False):
                     self._active_task_id = timing_task_id
                     timing_epoch = self._stage_timing.start_task(timing_task_id)
                     self._stage_timing.observe_sample(timing_task_id, gen.get("repeat_no"), execution_epoch=timing_epoch)
                     self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
-                    native_phase = _native_progress_snapshot(gen).get("phase")
+                    native = _native_progress_snapshot(gen)
+                    native_phase = native.get("phase")
+                    # Some hosts bypass the installed generate_media wrapper.
+                    # Admit native progress only after it changes within the same
+                    # executing task; the first poll may still contain the prior Save.
+                    signature = (native_phase, native.get("current"), native.get("total"), native.get("unit"))
+                    previous = getattr(self, "_polled_execution_progress", None)
+                    fresh_progress = (previous is not None and previous[0] == timing_task_id and
+                                      previous[1] != signature)
+                    trusted_progress = fresh_progress or bool(previous and previous[0] == timing_task_id and previous[2])
+                    self._polled_execution_progress = (timing_task_id, signature, trusted_progress)
+                    if execution_task_known and trusted_progress:
+                        self._stage_timing.observe_progress(
+                            timing_task_id, timing_epoch, native_phase,
+                            native.get("current"), native.get("total"), native.get("unit"),
+                            stage_id=_task_owned_stage_id(executing_source, native_phase, self._stage_timing),
+                        )
                     _recover_polled_stage_timing(
                         self._stage_timing, timing_task_id, timing_epoch, native_phase,
                         gen.get("status"), execution_task_known,
@@ -2245,10 +2264,11 @@ class StatusLitePlugin(WAN2GPPlugin):
                                                  self._stage_timing),
                             execution_epoch=timing_epoch,
                         )
-            elif execution_task_known and not getattr(self, "_generation_timing_observer_installed", False):
-                # The generation observer owns completion when installed. An idle
+            elif execution_task_known and not getattr(self, "_generation_timing_observer_seen", False):
+                # The generation observer owns completion once called. An idle
                 # poll may race with its entry before worker ownership is published.
                 self._stage_timing.finish_task(completed=False)
+                self._polled_execution_progress = None
             if active_task and gen.get("sliding_window"):
                 window_prompts = _window_prompts(
                     active_task["settings"].get("prompt"),

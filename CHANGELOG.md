@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Recovered live progress when a host bypasses the installed generation wrapper, while rejecting unchanged progress left over from the previous queued job.
+
 - Prevented delayed status polls from resetting a later job to Prepare after an abort and queue handover; worker events now own task, sample and window timing when the generation observer is installed.
 - Kept worker ownership authoritative between queued jobs so a previous image's Save status cannot seed the next video's timing, including H3 runs with the model kept loaded.
 - Published task ownership from the generation observer for hosts without the native active-task field, while retaining the legacy fallback when the observer is unavailable.
