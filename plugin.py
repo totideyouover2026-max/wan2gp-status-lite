@@ -2234,8 +2234,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                 if not getattr(self, "_generation_timing_observer_seen", False):
                     self._active_task_id = timing_task_id
                     timing_epoch = self._stage_timing.start_task(timing_task_id)
-                    self._stage_timing.observe_sample(timing_task_id, gen.get("repeat_no"), execution_epoch=timing_epoch)
-                    self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
+                    sample_changed = self._stage_timing.observe_sample(timing_task_id, gen.get("repeat_no"), execution_epoch=timing_epoch)
+                    window_changed = self._stage_timing.observe_window(timing_task_id, gen.get("window_no"), execution_epoch=timing_epoch)
                     native = _native_progress_snapshot(gen)
                     native_phase = native.get("phase")
                     # Some hosts bypass the installed generate_media wrapper.
@@ -2245,7 +2245,12 @@ class StatusLitePlugin(WAN2GPPlugin):
                     previous = getattr(self, "_polled_execution_progress", None)
                     fresh_progress = (previous is not None and previous[0] == timing_task_id and
                                       previous[1] != signature)
-                    trusted_progress = fresh_progress or bool(previous and previous[0] == timing_task_id and previous[2])
+                    # Trust belongs to one sample/window. Its counters can advance
+                    # before the native label stops saying Save for the previous one.
+                    trusted_progress = fresh_progress or bool(
+                        previous and previous[0] == timing_task_id and previous[2] and
+                        not sample_changed and not window_changed
+                    )
                     self._polled_execution_progress = (timing_task_id, signature, trusted_progress)
                     if execution_task_known and trusted_progress:
                         self._stage_timing.observe_progress(

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Prevented a previous window or sample's lingering Save status from trapping later Viggle and other sliding-window work in Save when generation uses the polling fallback.
+
 - Recovered live progress when a host bypasses the installed generation wrapper, while rejecting unchanged progress left over from the previous queued job.
 
 - Prevented delayed status polls from resetting a later job to Prepare after an abort and queue handover; worker events now own task, sample and window timing when the generation observer is installed.

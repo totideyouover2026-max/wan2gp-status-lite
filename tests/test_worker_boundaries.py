@@ -151,6 +151,37 @@ class WorkerBoundaryTests(unittest.TestCase):
         gen["progress_phase"] = ("Encoding Text Prompt", 1)
         self.assertEqual(self.snapshot(scope, owner, state)["stage_timing"]["last_stage"], "encode")
 
+    def test_polled_window_and_sample_boundaries_reject_previous_save(self):
+        for boundary in ("window_no", "repeat_no"):
+            with self.subTest(boundary=boundary):
+                scope = snapshot_helpers()
+                scope.update(_window_prompts=lambda *args: [], _window_prompt=lambda *args: None)
+                owner = self.owner(scope, lambda *args, **kwargs: True)
+                task = {"id": "viggle", "params": {"model_type": "viggle_animate"}}
+                gen = {"in_progress": True, "api_active_queue_task": task, "queue": [task],
+                       "window_no": 1, "repeat_no": 1, "sliding_window": True,
+                       "total_windows": 4, "progress_phase": ("Loading model", -1)}
+                state = {"gen": gen}
+                self.snapshot(scope, owner, state)
+                for phase, step in (("Denoising", 1), ("Saving File window1.mp4", -1)):
+                    gen["progress_phase"] = (phase, step)
+                    first = self.snapshot(scope, owner, state)
+                self.assertEqual(first["stage_timing"]["last_stage"], "save")
+                epoch = first["stage_timing"]["execution_epoch"]
+                gen[boundary] = 2
+                # The host advances its window/sample before replacing its Save label.
+                for _ in range(3):
+                    stale = self.snapshot(scope, owner, state)["stage_timing"]
+                    self.assertEqual(stale["last_stage"], "prepare")
+                    self.assertNotIn("save", stale["stages"])
+                gen.update(progress_phase=("Denoising", 1), phase_progress_units=(3, "steps"))
+                recovered = self.snapshot(scope, owner, state)["stage_timing"]
+                self.assertEqual(recovered["execution_epoch"], epoch)
+                self.assertEqual(recovered["last_stage"], "denoise")
+                self.assertEqual(recovered["progress"]["current"], 1)
+                self.assertEqual(recovered["segments"][0]["last_stage"], "save")
+                self.assertEqual(recovered["segments"][0]["window_no"], 1)
+
     def test_unobserved_legacy_host_keeps_queue_fallback(self):
         scope = snapshot_helpers()
         owner = self.owner(scope, lambda *args, **kwargs: True)
