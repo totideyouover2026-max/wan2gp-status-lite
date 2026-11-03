@@ -6,6 +6,8 @@ The header reports the current Wan2GP activity, total elapsed time, observed gen
 
 The selected stage card and its activity details show stage timing. **Total elapsed** appears in the header, including when the panel is collapsed.
 
+The activity log has a fixed height so additional phases do not move nearby controls. It follows new entries automatically; scroll up to inspect earlier activity, then return to the bottom to resume following. Average step time and ETA use the current phase, while stage totals include all passes.
+
 Stages appear only when relevant. Inputs, Enhance, and Save are optional; a model or workflow that does not report one of them will not be forced to display it as active work.
 
 WanGP V13 can provide activity counters such as `Encoding Text Prompt · 50/50 layers`, `Denoising · Step 8/8`, and `VAE Decoding · 28/28 tiles`. These activities remain inside the existing seven top-level stages. Inputs, Encode, Generate, Decode, and Enhance can each show their detailed sub-activities, including repeated prompts, passes, or windows.

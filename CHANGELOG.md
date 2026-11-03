@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.3.1 — 2026-11-03
+
 - Kept the live activity log at a fixed height with scrolling, following new entries unless scrolled back, so extra phases and wrapped text no longer push nearby controls around.
 
 - Fixed average step time and ETA carrying earlier phase durations into later H3 and other multi-pass generation or enhancement phases; retained cumulative stage totals and isolated timing samples and final-step countdowns at phase boundaries.

@@ -1,4 +1,13 @@
-# Status Lite 1.3.0
+# Status Lite v1.3.1
+
+Status Lite 1.3.1 fixes timing across multiple generation phases and keeps the live activity panel steady during fast or complex runs.
+
+- Calculate average step time and ETA from the current phase, preventing earlier H3 and other generation passes from inflating later estimates while retaining cumulative stage totals.
+- Keep the activity log at a fixed height with scrolling. Follow new entries automatically, and preserve your position when you scroll back to earlier activity.
+- Track FlashVSR loading and named upscale, decode and colour-correction passes in Enhance with their actual counters.
+- Improve task ownership and progress recovery across queued jobs, aborted runs, repeated task IDs, sliding windows and samples, preventing stale Save or Prepare activity from hiding later work.
+
+## Status Lite 1.3.0
 
 Status Lite 1.3.0 improves enhancement-stage tracking, background timing recovery and voice/audio activity reporting.
 
