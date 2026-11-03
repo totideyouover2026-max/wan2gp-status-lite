@@ -876,7 +876,16 @@ def _performance_snapshot(gen):
     for item in list(source.get("steps") or [])[-MAX_STEP_TELEMETRY:]:
         if isinstance(item, dict):
             steps.append({str(key)[:80]: _telemetry_value(value) for key, value in item.items()})
+    activities = []
+    active_activity = source.get("_active_activity")
+    activity_started = source.get("_activity_started_at")
+    for index, item in enumerate(list(source.get("activities") or [])):
+        copy = dict(item)
+        if index == active_activity and activity_started is not None:
+            copy["elapsed"] += max(0.0, time.perf_counter() - activity_started)
+        activities.append(copy)
     return {
+        "activities": activities[-200:],
         "id": str(source.get("id") or "")[:120],
         "task_id": _telemetry_value(source.get("task_id")),
         "started_at": _telemetry_value(source.get("started_at")),
@@ -1011,6 +1020,7 @@ def _observe_postprocessing_progress(performance, progress_callback, torch_modul
                     "completed_at": time.time(),
                     "memory": _memory_snapshot(torch_module),
                     "label": label,
+                    "stage": "post",
                 })
                 if len(performance["steps"]) > MAX_STEP_TELEMETRY:
                     performance["steps"] = performance["steps"][-MAX_STEP_TELEMETRY:]
@@ -1019,6 +1029,62 @@ def _observe_postprocessing_progress(performance, progress_callback, torch_modul
                 performance["_last_step"] = current
         return _forward_processor_progress(progress_callback, phase, current_step, total_steps, unit)
 
+    observed._status_pro_performance_observer = True
+    return observed
+
+
+def _observe_flashvsr_progress(performance, callback, loading=False):
+    """Retain native FlashVSR endpoints and exclusive timings across UI polls."""
+    activities = performance.setdefault("activities", [])
+    invocation = len(activities)
+    pass_no = 0
+
+    def close(completed_index=None):
+        index = performance.pop("_active_activity", None)
+        started = performance.pop("_activity_started_at", None)
+        if index is not None and started is not None:
+            activity = activities[index]
+            charged = activities[completed_index] if completed_index is not None else activity
+            charged["elapsed"] += max(0.0, time.perf_counter() - started)
+            activity["state"] = "complete"
+            activity["completed_at"] = time.time()
+
+    def observed(phase, current=None, total=None, unit=None):
+        nonlocal pass_no
+        native = str(phase or "").strip()
+        if native.lower() == "denoising" and current == 0:
+            pass_no += 1
+        if loading:
+            label = "FlashVSR - Loading models"
+        else:
+            operation = {"denoising": "Upscaling", "tcdecoder decoding": "Decoding",
+                         "color correction": "Colour correction"}.get(native.lower(), native)
+            label = f"FlashVSR - Pass {max(1, pass_no)} - {operation}"
+            if native.lower() in ("denoising", "tcdecoder decoding"):
+                # These are stream chunks, including TCDecoder's outer counter;
+                # they are neither generation steps nor spatial decoder tiles.
+                unit = "chunks"
+        key = f"{invocation}:{label}"
+        index = next((i for i, item in enumerate(activities) if item["id"] == key), None)
+        if index is None:
+            index = len(activities)
+            activities.append({"id": key, "label": label, "stage": "post", "elapsed": 0.0,
+                               "started_at": time.time()})
+        activity = activities[index]
+        # After a decoded chunk, FlashVSR reports the next denoising completion
+        # without a separate start event. Charge that interval to the work just
+        # completed, rather than leaving it on the preceding decoder.
+        advanced = current is not None and current > (activity.get("current") or 0)
+        close(index if advanced else None)
+        metric = _validated_phase_progress(label, current, total, unit)
+        activity.update({key: metric[key] for key in ("current", "total", "unit", "progress")})
+        activity["state"] = "current"
+        activity.pop("completed_at", None)
+        performance["_active_activity"] = index
+        performance["_activity_started_at"] = time.perf_counter()
+        return _forward_processor_progress(callback, label, current, total, unit)
+
+    observed.finish = close
     observed._status_pro_performance_observer = True
     return observed
 
@@ -1479,6 +1545,10 @@ def plan_stages_for_task(task, telemetry_context=None):
     """Plan stable top-level presentation stages from the queued job definition."""
     context = telemetry_context if isinstance(telemetry_context, dict) else {}
     settings = context.get("settings") if isinstance(context.get("settings"), dict) else {}
+    params = task.get("params") if isinstance(task, dict) and isinstance(task.get("params"), dict) else {}
+    mode = str(settings.get("mode") or params.get("mode") or "").strip().lower()
+    if mode in {"edit_postprocessing", "edit_remux", "edit_audio"}:
+        return ["prepare", "post", "save"] if mode != "edit_remux" else ["prepare", "save"]
     h3 = _task_is_h3(task, settings)
     yue2 = _task_is_yue2(task, settings)
     yue2_hum = _task_is_yue2_hum(task, settings)
@@ -2073,8 +2143,17 @@ class StatusLitePlugin(WAN2GPPlugin):
                 if not self._stage_timing.begin_enhancement(task_id, epoch, activity):
                     return original(*args, **kwargs)
                 accepting = True
+                flash_progress = None
                 try:
                     callback = get_argument("progress_callback")
+                    if label.startswith("FlashVSR"):
+                        performance = getattr(self, "_latest_performance", None)
+                        if not (isinstance(performance, dict) and performance.get("_flashvsr_execution") == execution):
+                            performance = _new_performance_observer(task_id)
+                            performance["_flashvsr_execution"] = execution
+                        self._latest_performance = performance
+                        flash_progress = _observe_flashvsr_progress(performance, callback, loading=name == "load_upsampler")
+                        callback = flash_progress
                     if callable(callback) or "progress_callback" in signature.parameters or extra_key:
                         performance = None
                         if not getattr(callback, "_status_pro_performance_observer", False):
@@ -2124,6 +2203,8 @@ class StatusLitePlugin(WAN2GPPlugin):
                     return result
                 finally:
                     accepting = False
+                    if flash_progress is not None:
+                        flash_progress.finish()
                     # VAE upscaler preparation can precede text encoding/sampling.
                     resume = previous if name == "prepare_vae_upsampler" else None
                     self._stage_timing.end_enhancement(task_id, epoch, resume=resume)
@@ -2166,6 +2247,13 @@ class StatusLitePlugin(WAN2GPPlugin):
                 continue
             for name in entries:
                 installed = install(module, name, label, resolver=getattr(module, display, None) if display else None) or installed
+        try:
+            bridge = importlib.import_module("postprocessing.flashvsr.wgp_bridge").FlashVSRBridge
+        except (ImportError, AttributeError):
+            pass
+        else:
+            installed = install(bridge, "load_upsampler", "FlashVSR - Loading models") or installed
+            installed = install(bridge, "upscale", "FlashVSR") or installed
         self._postprocessing_step_observer_installed = installed
 
     def _run_snapshot_json(self, state):
@@ -3256,6 +3344,15 @@ class StatusLitePlugin(WAN2GPPlugin):
             String(observerTaskId) !== String(run.queue_task_id)
         ) return;
         const observerId = String(performance.id || "observer");
+        const activities = new Map((run.processor_activities || []).map(item => [item.id, item]));
+        (Array.isArray(performance.activities) ? performance.activities : []).forEach(item => {
+            if (!item || item.stage !== "post" || !Number.isFinite(Number(item.elapsed))) return;
+            if (Number(item.started_at) * 1000 < Number(run.started_at) - 1000) return;
+            if (run.completed_at && Number(item.started_at) * 1000 > Number(run.completed_at) + 1000) return;
+            const copy = {...item, id: `${observerId}:${item.id}`};
+            activities.set(copy.id, copy);
+        });
+        run.processor_activities = [...activities.values()].slice(-200);
         run.step_performance = Array.isArray(run.step_performance) ? run.step_performance : [];
         run._performance_step_keys = run._performance_step_keys || {};
         (Array.isArray(performance.steps) ? performance.steps : []).forEach(step => {
@@ -4707,7 +4804,7 @@ class StatusLitePlugin(WAN2GPPlugin):
                 groups.set(key, group);
             }
             if (step.label) group.label = String(step.label).slice(0, 300);
-            group.stage = performanceStageId(group.label);
+            group.stage = step.stage === "post" ? "post" : performanceStageId(group.label);
             const duration = optionalNumber(step.duration_seconds);
             if (Number.isFinite(duration) && duration >= 0 && duration <= 86400) {
                 group.duration += duration;
@@ -4879,6 +4976,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         if (Number.isFinite(activeRun._stageTimingEpoch) && activeRun._stageTimingEpoch !== timingEpoch) return false;
         activeRun._stageTimingEpoch = timingEpoch;
         const state = namespace.state;
+        state.processorActivities = activeRun.processor_activities || [];
         const receivedAt = browserMonotonicNow();
         const activeId = STAGE_DEFS.map(definition => definition.id).find(id =>
             stages[id] && typeof stages[id] === "object" && stages[id].active === true
@@ -5089,6 +5187,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const total = optionalNumber(steps && steps.total);
         record.stepCurrent = current;
         record.stepTotal = total;
+        record.stepUnit = String(steps && steps.unit || "steps").toLowerCase();
         if (!Number.isFinite(current) || !Number.isFinite(record.elapsed)) return;
 
         if (!Number.isFinite(record.lastStepCurrent) || !Number.isFinite(record.lastStepElapsed)) {
@@ -5631,20 +5730,23 @@ class StatusLitePlugin(WAN2GPPlugin):
     function stageActivities(state, record) {
         if (!record || !["input", "encode", "denoise", "decode", "post"].includes(record.id)) return [];
         const seen = new Set();
-        return state.phaseOrder
+        const retained = record.id === "post" ? (state.processorActivities || []) : [];
+        const observed = state.phaseOrder
             .filter(id => {
                 if (seen.has(id)) return false;
                 seen.add(id);
                 return true;
             })
             .map(id => state.phases[id])
-            .filter(phase => phase && phase.stage === record.id)
+            .filter(phase => phase && phase.stage === record.id &&
+                !(retained.length && /^FlashVSR\b/i.test(phase.label)))
             .map(phase => ({
                 label: phase.label,
                 state: phase.state,
                 elapsed: phase.elapsed,
                 current: phase.current, total: phase.total, unit: phase.unit, progress: phase.progress
             }));
+        return observed.concat(retained);
     }
 
     function detailMessage(record, hasActivities = false) {
@@ -5833,6 +5935,7 @@ class StatusLitePlugin(WAN2GPPlugin):
         const stepMetric = namespace.panel.querySelector("[data-sp-step-metric]");
         if (stepMetric) {
             const showStepTime = (selected.id === "denoise" || selected.id === "post") &&
+                /^steps?$/.test(selected.stepUnit || "steps") &&
                 (Number.isFinite(selected.stepCurrent) || Number.isFinite(selected.stepTotal));
             stepMetric.hidden = !showStepTime;
             text(stepMetric, "[data-sp-detail-step-time]", Number.isFinite(selected.stepSeconds)

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reported FlashVSR model loading and named upscale/decode/colour-correction passes in Enhance, retaining actual chunk/frame counters and timings between polls and in History; prevented processor denoising from inventing a Generate stage and planned standalone edits around their actual work.
+
 - Prevented a previous window or sample's lingering Save status from trapping later Viggle and other sliding-window work in Save when generation uses the polling fallback.
 
 - Recovered live progress when a host bypasses the installed generation wrapper, while rejecting unchanged progress left over from the previous queued job.
