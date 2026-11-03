@@ -2550,9 +2550,11 @@ class StatusLitePlugin(WAN2GPPlugin):
     <div class="status-lite__detail" data-sp-detail role="tabpanel" aria-live="polite">
       <div class="status-lite__detail-copy">
         <strong data-sp-detail-name>Preparing</strong>
-        <span class="status-lite__detail-activities" data-sp-detail-activities hidden></span>
-        <span class="status-lite__detail-model" data-sp-detail-model hidden></span>
-        <span data-sp-detail-message>Waiting for generation progress.</span>
+        <div class="status-lite__detail-log" data-sp-detail-log tabindex="0" role="region" aria-label="Stage activity log">
+          <span class="status-lite__detail-activities" data-sp-detail-activities hidden></span>
+          <span class="status-lite__detail-model" data-sp-detail-model hidden></span>
+          <span data-sp-detail-message>Waiting for generation progress.</span>
+        </div>
       </div>
       <dl class="status-lite__metrics">
         <div><dt>Status</dt><dd data-sp-detail-state>Pending</dd></div>
@@ -3010,13 +3012,25 @@ class StatusLitePlugin(WAN2GPPlugin):
     min-width: 0;
 }
 .status-lite__detail-copy strong { font-size: .86rem; }
+.status-lite__detail-log {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    height: 80px;
+    min-width: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
+    overscroll-behavior: contain;
+    overflow-anchor: none;
+}
+.status-lite__detail-log > span { flex-shrink: 0; }
 .status-lite__detail-copy span {
     max-width: 100%;
-    overflow: hidden;
     color: var(--sp-muted);
     font-size: .74rem;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    white-space: normal;
 }
 .status-lite__detail-copy .status-lite__detail-model {
     color: color-mix(in srgb, var(--sp-accent) 76%, var(--sp-muted));
@@ -3120,7 +3134,8 @@ class StatusLitePlugin(WAN2GPPlugin):
         white-space: normal;
     }
     .status-lite__metrics {
-        grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 26px);
         width: 100%;
     }
 }
@@ -5012,6 +5027,7 @@ class StatusLitePlugin(WAN2GPPlugin):
             record.runCount = Number.isFinite(runCount) ? Math.max(0, Math.floor(runCount)) : Math.max(1, record.runCount || 0);
             record.serverTimed = Number.isFinite(elapsed);
             record.serverElapsed = Number.isFinite(elapsed) ? Math.max(0, elapsed) : null;
+            record.serverActiveElapsed = optionalNumber(source.active_elapsed);
             record.serverReceivedAt = definition.id === activeId ? receivedAt : null;
             record.serverActive = definition.id === activeId;
             record.serverTimingRevision = optionalNumber(timing.revision);
@@ -5132,12 +5148,45 @@ class StatusLitePlugin(WAN2GPPlugin):
         );
     }
 
+    function phaseTimingElapsed(record) {
+        return Number.isFinite(record.elapsed)
+            ? Math.max(0, record.elapsed - (record.timingElapsedBase || 0)) : null;
+    }
+
+    function updatePhaseTiming(record, snapshot, phaseId) {
+        const first = !record.timingPhaseId;
+        const visitChanged = record.timingRunCount !== record.runCount;
+        const current = optionalNumber(snapshot.steps && snapshot.steps.current);
+        const counterReset = Number.isFinite(current) && Number.isFinite(record.lastStepCurrent) &&
+            current < record.lastStepCurrent;
+        if (first || visitChanged || record.timingPhaseId !== phaseId || counterReset) {
+            // Server elapsed is the sum of every visit to this stage. Only the
+            // active visit belongs to the new pass, including steps missed by UI polls.
+            record.timingElapsedBase = record.serverTimed && Number.isFinite(record.serverActiveElapsed) &&
+                (first || visitChanged)
+                ? Math.max(0, record.serverElapsed - record.serverActiveElapsed)
+                : (first ? (record.serverTimed ? 0 : (record.elapsedBase || 0)) : record.elapsed);
+            record.samples = [];
+            record.eta = null;
+            record.lastStepCurrent = null;
+            record.lastStepElapsed = null;
+            record.lastStepAt = null;
+            record.stepSamples = [];
+            record.stepSeconds = null;
+            record.finalStepStartedAt = null;
+            record.finalStepDuration = null;
+        }
+        record.timingPhaseId = phaseId;
+        record.timingRunCount = record.runCount;
+    }
+
     function updateEta(record) {
-        if (!Number.isFinite(record.progress) || record.progress <= 0 || record.progress >= 100 || !Number.isFinite(record.elapsed) || record.elapsed <= 0) {
+        const elapsed = phaseTimingElapsed(record);
+        if (!Number.isFinite(record.progress) || record.progress <= 0 || record.progress >= 100 || !Number.isFinite(elapsed) || elapsed <= 0) {
             record.eta = record.progress >= 100 ? 0 : null;
             return;
         }
-        const overallEstimate = record.elapsed * (100 - record.progress) / record.progress;
+        const overallEstimate = elapsed * (100 - record.progress) / record.progress;
         let estimate = overallEstimate;
         const useful = record.samples.filter(sample => sample.progress <= record.progress);
         if (useful.length >= 2) {
@@ -5161,20 +5210,22 @@ class StatusLitePlugin(WAN2GPPlugin):
     }
 
     function updateDenoiseEta(record) {
+        const elapsed = phaseTimingElapsed(record);
         if (!Number.isFinite(record.stepCurrent) || !Number.isFinite(record.stepTotal) ||
-            !Number.isFinite(record.elapsed) || record.stepCurrent <= 0 || record.elapsed <= 0) {
+            !Number.isFinite(elapsed) || record.stepCurrent <= 0 || elapsed <= 0) {
             record.eta = null;
             return;
         }
         if (record.stepCurrent >= record.stepTotal) {
+            record.stepSeconds = elapsed / record.stepCurrent;
             record.eta = 0;
             return;
         }
-        const fallbackStepSeconds = record.elapsed / record.stepCurrent;
+        const fallbackStepSeconds = elapsed / record.stepCurrent;
         const fallbackEta = fallbackStepSeconds * (record.stepTotal - record.stepCurrent);
         const nativeEta = optionalNumber(record.nativeEta);
         record.eta = clamp(Number.isFinite(nativeEta) ? nativeEta : fallbackEta, 0, 86400);
-        record.stepSeconds = (record.elapsed + record.eta) / record.stepTotal;
+        record.stepSeconds = (elapsed + record.eta) / record.stepTotal;
         if (Number.isFinite(record.finalStepStartedAt) && !Number.isFinite(record.finalStepDuration) &&
             Number.isFinite(record.stepSeconds) && record.stepSeconds > 0) {
             record.finalStepDuration = record.stepSeconds;
@@ -5322,10 +5373,12 @@ class StatusLitePlugin(WAN2GPPlugin):
         record.reportedElapsed = Number.isFinite(snapshot.stageElapsed) ? snapshot.stageElapsed : null;
         record.reportedAt = now;
         record.nativeEta = optionalNumber(snapshot.nativeEta);
+        updatePhaseTiming(record, snapshot, activeState.currentPhaseId);
+        const timingElapsed = phaseTimingElapsed(record);
         const lastSample = record.samples[record.samples.length - 1];
-        if (Number.isFinite(record.progress) && Number.isFinite(record.elapsed) &&
-            (!lastSample || lastSample.progress !== record.progress || Math.abs(lastSample.elapsed - record.elapsed) >= 1)) {
-            record.samples.push({ progress: record.progress, elapsed: record.elapsed });
+        if (Number.isFinite(record.progress) && Number.isFinite(timingElapsed) &&
+            (!lastSample || lastSample.progress !== record.progress || Math.abs(lastSample.elapsed - timingElapsed) >= 1)) {
+            record.samples.push({ progress: record.progress, elapsed: timingElapsed });
             record.samples = record.samples.slice(-30);
         }
         updateStepTiming(record, snapshot.steps, now);
@@ -5871,6 +5924,10 @@ class StatusLitePlugin(WAN2GPPlugin):
         const state = namespace.state;
         const selected = state.records[state.selectedId] || state.records[state.currentId] || state.records.prepare;
         const activities = stageActivities(state, selected);
+        const log = namespace.panel.querySelector("[data-sp-detail-log]");
+        const previousScrollTop = log ? log.scrollTop : 0;
+        const followLog = log && (namespace.detailLogStageId !== selected.id ||
+            log.scrollHeight - log.clientHeight - log.scrollTop <= 4);
         let etaText = "—";
         const remaining = remainingEstimate(state, selected);
         if (selected.state === "current" && Number.isFinite(remaining)) etaText = formatDuration(remaining, true);
@@ -5942,6 +5999,10 @@ class StatusLitePlugin(WAN2GPPlugin):
                 ? `${formatLiveStepDuration(selected.stepSeconds)}/step`
                 : "Calculating…");
         }
+        // Follow new activity while at the bottom; preserve a user's position
+        // while they scroll back through earlier entries between render ticks.
+        if (log) log.scrollTop = followLog ? log.scrollHeight : previousScrollTop;
+        namespace.detailLogStageId = selected.id;
     }
 
     function applyCollapsed(namespace) {

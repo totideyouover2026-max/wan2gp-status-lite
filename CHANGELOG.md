@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Kept the live activity log at a fixed height with scrolling, following new entries unless scrolled back, so extra phases and wrapped text no longer push nearby controls around.
+
+- Fixed average step time and ETA carrying earlier phase durations into later H3 and other multi-pass generation or enhancement phases; retained cumulative stage totals and isolated timing samples and final-step countdowns at phase boundaries.
+
 - Reported FlashVSR model loading and named upscale/decode/colour-correction passes in Enhance, retaining actual chunk/frame counters and timings between polls and in History; prevented processor denoising from inventing a Generate stage and planned standalone edits around their actual work.
 
 - Prevented a previous window or sample's lingering Save status from trapping later Viggle and other sliding-window work in Save when generation uses the polling fallback.
